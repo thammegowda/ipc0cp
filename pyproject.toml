@@ -27,6 +27,17 @@ classifiers = [
     "Topic :: System :: Networking",
 ]
 keywords = ["ipc", "shared-memory", "zero-copy", "interprocess", "python", "cpp"]
+dependencies = [
+    "numpy>=1.20.0",
+    "pillow>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "pytest-timeout>=2.0.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/thammegowda/ipc0cp"
@@ -34,6 +45,6 @@ Repository = "https://github.com/thammegowda/ipc0cp"
 Issues = "https://github.com/thammegowda/ipc0cp/issues"
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["python"]
 include = ["ipc0cp*"]
 exclude = ["tests*", "docs*"]
