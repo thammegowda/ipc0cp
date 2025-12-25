@@ -1,5 +1,4 @@
-#ifndef IPC0CP_IPC_HPP
-#define IPC0CP_IPC_HPP
+#pragma once
 
 #include <string>
 #include <cstddef>
@@ -44,5 +43,3 @@ protected:
 };
 
 } // namespace ipc0cp
-
-#endif // IPC0CP_IPC_HPP
