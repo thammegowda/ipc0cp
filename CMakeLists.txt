@@ -17,17 +17,17 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -Wall")
 
 # Library sources
 set(IPC0CP_SOURCES
-    csrc/ipc0cp/ipc.cpp
+    cpp/ipc0cp/ipc.cpp
 )
 
 set(IPC0CP_HEADERS
-    csrc/ipc0cp/ipc.hpp
+    cpp/ipc0cp/ipc.hpp
 )
 
 # Create static library
 add_library(ipc0cp_static STATIC ${IPC0CP_SOURCES})
 target_include_directories(ipc0cp_static PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/csrc>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
     $<INSTALL_INTERFACE:include>
 )
 set_target_properties(ipc0cp_static PROPERTIES
@@ -38,7 +38,7 @@ set_target_properties(ipc0cp_static PROPERTIES
 # Create shared library
 add_library(ipc0cp_shared SHARED ${IPC0CP_SOURCES})
 target_include_directories(ipc0cp_shared PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/csrc>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
     $<INSTALL_INTERFACE:include>
 )
 set_target_properties(ipc0cp_shared PROPERTIES
