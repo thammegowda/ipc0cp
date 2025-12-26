@@ -24,6 +24,47 @@ from .serialize import SERIALIZERS, MAX_METADATA_SIZE, get_serializer
 
 logger = logging.getLogger(__name__)
 
+
+# Error types enum
+class RingBufferError:
+    """Error types for ring buffer operations."""
+    NONE = "none"
+    NOT_INITIALIZED = "not_initialized"
+    SHM_NOT_FOUND = "shm_not_found"
+    SIZE_MISMATCH = "size_mismatch"
+    INVALID_METADATA = "invalid_metadata"
+    INVALID_SLOT = "invalid_slot"
+    TIMEOUT = "timeout"
+    BUFFER_EMPTY = "buffer_empty"
+    DESERIALIZATION_FAILED = "deserialization_failed"
+    CORRUPT_PAYLOAD = "corrupt_payload"
+
+
+class RingBufferException(Exception):
+    """Exception for ring buffer errors."""
+    def __init__(self, error_type: str, message: str = None):
+        self.error_type = error_type
+        if message is None:
+            message = self._get_default_message(error_type)
+        super().__init__(message)
+    
+    @staticmethod
+    def _get_default_message(error_type: str) -> str:
+        messages = {
+            RingBufferError.NONE: "No error",
+            RingBufferError.NOT_INITIALIZED: "Shared memory not initialized",
+            RingBufferError.SHM_NOT_FOUND: "Shared memory segment not found",
+            RingBufferError.SIZE_MISMATCH: "Shared memory size mismatch",
+            RingBufferError.INVALID_METADATA: "Invalid metadata",
+            RingBufferError.INVALID_SLOT: "Invalid slot data",
+            RingBufferError.TIMEOUT: "Operation timed out",
+            RingBufferError.BUFFER_EMPTY: "Buffer is empty",
+            RingBufferError.DESERIALIZATION_FAILED: "Deserialization failed",
+            RingBufferError.CORRUPT_PAYLOAD: "Corrupt payload: sentinel bytes mismatch",
+        }
+        return messages.get(error_type, "Unknown error")
+
+
 # Constants
 HEADER_SIZE = 24  # 3 * uint64: write_offset, read_offset, total_data_bytes
 SLOT_HEADER_SIZE = 20  # next_offset(8) + metadata_size(4) + payload_size(8)
@@ -425,6 +466,25 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         
         # Delegate to push_raw
         return self.push_raw(metadata_json, payload, timeout)
+    
+    def close(self):
+        """
+        Close the producer by sending end-of-stream marker and closing shared memory.
+        
+        The end-of-stream marker is a slot with payload_size=0, which signals
+        the consumer to stop reading.
+        """
+        if self.shm is not None:
+            # Push end-of-stream marker (empty metadata + empty payload)
+            try:
+                self.push_raw("{}", b"", timeout=5.0)
+                logger.info("Sent end-of-stream marker")
+            except Exception as e:
+                logger.warning(f"Failed to send end-of-stream marker: {e}")
+            
+            # Close shared memory
+            self.shm.close()
+            logger.info(f"Closed shared memory '{self.shm_name}'")
 
 
 class SharedRingBufferConsumer(SharedRingBufferBase):
@@ -455,6 +515,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             auto_attach: If True, automatically attach to shared memory in constructor
         """
         super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
+        self.eos_received = False  # Track if end-of-stream was received
         if auto_attach:
             self._attach()
     
@@ -529,14 +590,14 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             timeout: Maximum time to wait in seconds (None = infinite if blocking)
             
         Returns:
-            Deserialized object if successful, None if buffer is empty and non-blocking
+            Deserialized object, or None if end-of-stream marker received
             
         Raises:
-            RuntimeError: If shared memory is not initialized
-            ValueError: If slot data is corrupted or unsupported type
+            RingBufferException: With error_type indicating the specific error
+            ValueError: If metadata is invalid
         """
         if self.shm is None:
-            raise RuntimeError("Shared memory not initialized")
+            raise RingBufferException(RingBufferError.NOT_INITIALIZED)
         
         # Wait for data if blocking
         start_time = time.time()
@@ -548,10 +609,10 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
                 break
             
             if not self.blocking:
-                return None
+                raise RingBufferException(RingBufferError.BUFFER_EMPTY)
             
             if timeout is not None and (time.time() - start_time) >= timeout:
-                return None
+                raise RingBufferException(RingBufferError.TIMEOUT, f"Timeout after {timeout} seconds")
             
             time.sleep(0.0005)  # 500 microseconds
         
@@ -574,6 +635,14 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         payload_size = self._read_uint64(current_pos)
         current_pos = self._advance_pos(current_pos, 8)
         
+        # Check for end-of-stream marker (payload_size == 0)
+        if payload_size == 0:
+            self.eos_received = True
+            logger.info("Received end-of-stream marker")
+            # Update read_offset to consume the EOS slot
+            self._set_read_offset(next_offset)
+            return None
+        
         # Read metadata JSON
         metadata_bytes = self._read_bytes(current_pos, metadata_size)
         current_pos = self._advance_pos(current_pos, metadata_size)
@@ -588,9 +657,9 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         # Read and verify start sentinel
         start_sentinel = self._read_bytes(current_pos, 1)
         if len(start_sentinel) != 1 or start_sentinel[0] != SENTINEL_BYTE:
-            error_msg = f"Data corruption: invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})"
+            error_msg = f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})"
             self.last_error = error_msg
-            raise ValueError(error_msg)
+            raise RingBufferException(RingBufferError.CORRUPT_PAYLOAD, error_msg)
         current_pos = self._advance_pos(current_pos, 1)
         
         # Read payload
@@ -600,9 +669,9 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         # Read and verify end sentinel
         end_sentinel = self._read_bytes(current_pos, 1)
         if len(end_sentinel) != 1 or end_sentinel[0] != SENTINEL_BYTE:
-            error_msg = f"Data corruption: invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})"
+            error_msg = f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})"
             self.last_error = error_msg
-            raise ValueError(error_msg)
+            raise RingBufferException(RingBufferError.CORRUPT_PAYLOAD, error_msg)
         
         # Get object type and deserialize
         obj_type = metadata_dict.get('type')
@@ -614,9 +683,9 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         try:
             obj = serializer.deserialize(metadata_dict, payload)
         except Exception as e:
-            error_msg = f"Failed to deserialize object: {e}"
+            error_msg = f"Failed to deserialize: {e}"
             self.last_error = error_msg
-            raise ValueError(error_msg)
+            raise RingBufferException(RingBufferError.DESERIALIZATION_FAILED, error_msg) from e
         
         # Update read_offset to next_offset
         self._set_read_offset(next_offset)

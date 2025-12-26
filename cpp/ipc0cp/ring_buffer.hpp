@@ -8,8 +8,58 @@
 #include <chrono>
 #include <map>
 #include <vector>
+#include <stdexcept>
 
 namespace ipc0cp {
+
+/**
+ * @brief Error types for ring buffer operations
+ */
+enum class RingBufferError {
+    None,
+    NotInitialized,
+    ShmNotFound,
+    SizeMismatch,
+    InvalidMetadata,
+    InvalidSlot,
+    Timeout,
+    BufferEmpty,
+    DeserializationFailed,
+    CorruptPayload
+};
+
+/**
+ * @brief Convert error to string
+ */
+inline std::string errorToString(RingBufferError error) {
+    switch (error) {
+        case RingBufferError::None: return "No error";
+        case RingBufferError::NotInitialized: return "Shared memory not initialized";
+        case RingBufferError::ShmNotFound: return "Shared memory segment not found";
+        case RingBufferError::SizeMismatch: return "Shared memory size mismatch";
+        case RingBufferError::InvalidMetadata: return "Invalid metadata";
+        case RingBufferError::InvalidSlot: return "Invalid slot data";
+        case RingBufferError::Timeout: return "Operation timed out";
+        case RingBufferError::BufferEmpty: return "Buffer is empty";
+        case RingBufferError::DeserializationFailed: return "Deserialization failed";
+        case RingBufferError::CorruptPayload: return "Corrupt payload: sentinel bytes mismatch";
+        default: return "Unknown error";
+    }
+}
+
+/**
+ * @brief Exception class for ring buffer errors
+ */
+class RingBufferException : public std::runtime_error {
+public:
+    RingBufferError error_type;
+    
+    explicit RingBufferException(RingBufferError error) 
+        : std::runtime_error(errorToString(error)), error_type(error) {}
+    
+    RingBufferException(RingBufferError error, const std::string& msg) 
+        : std::runtime_error(msg), error_type(error) {}
+};
 
 /**
  * Shared Ring Buffer Memory Layout
@@ -73,39 +123,6 @@ struct RingBufferObject {
         return *ptr;
     }
 };
-
-/**
- * @brief Error types for ring buffer operations
- */
-enum class RingBufferError {
-    NotInitialized,
-    ShmNotFound,
-    SizeMismatch,
-    InvalidMetadata,
-    InvalidSlot,
-    Timeout,
-    BufferEmpty,
-    DeserializationFailed,
-    CorruptPayload
-};
-
-/**
- * @brief Convert error to string
- */
-inline std::string errorToString(RingBufferError error) {
-    switch (error) {
-        case RingBufferError::NotInitialized: return "Shared memory not initialized";
-        case RingBufferError::ShmNotFound: return "Shared memory segment not found";
-        case RingBufferError::SizeMismatch: return "Shared memory size mismatch";
-        case RingBufferError::InvalidMetadata: return "Invalid metadata";
-        case RingBufferError::InvalidSlot: return "Invalid slot data";
-        case RingBufferError::Timeout: return "Operation timed out";
-        case RingBufferError::BufferEmpty: return "Buffer is empty";
-        case RingBufferError::DeserializationFailed: return "Deserialization failed";
-        case RingBufferError::CorruptPayload: return "Corrupt payload: sentinel bytes mismatch";
-        default: return "Unknown error";
-    }
-}
 
 /**
  * @brief Result type for operations that can fail
@@ -225,7 +242,8 @@ public:
     /**
      * @brief Pop an object from the ring buffer
      * @param timeout Maximum time to wait in milliseconds (nullopt = infinite if blocking)
-     * @return Object if successful, nullopt if empty and non-blocking or timeout
+     * @return Deserialized object, or std::nullopt if end-of-stream marker received
+     * @throws RingBufferException with error_type indicating the error
      */
     std::optional<RingBufferObject> pop(
         std::optional<std::chrono::milliseconds> timeout = std::nullopt
@@ -243,6 +261,7 @@ private:
     );
     
     RingBufferError last_error_ = RingBufferError::NotInitialized;
+    bool eos_received_ = false;  ///< Track if end-of-stream was received
 };
 
 /**
@@ -295,6 +314,14 @@ public:
         const std::vector<uint8_t>& payload,
         int timeout_ms = -1
     );
+    
+    /**
+     * @brief Close the producer by sending end-of-stream marker.
+     * 
+     * Sends a slot with payload_size=0 to signal the consumer to stop,
+     * then closes and unlinks the shared memory.
+     */
+    void close();
     
     /**
      * @brief Get available space in buffer

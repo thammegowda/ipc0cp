@@ -1,0 +1,73 @@
+{
+  "config": {
+    "runs": 3,
+    "duration": 60.0,
+    "min_size": 524288,
+    "max_size": 5242880
+  },
+  "stdio": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 314.94,
+        "consumer_throughput_mbps": 314.93,
+        "producer_bytes": 19816523607,
+        "consumer_bytes": 19816523607,
+        "producer_messages": 6801,
+        "consumer_messages": 6801
+      },
+      {
+        "producer_throughput_mbps": 321.72,
+        "consumer_throughput_mbps": 321.57,
+        "producer_bytes": 20245740145,
+        "consumer_bytes": 20245740145,
+        "producer_messages": 7031,
+        "consumer_messages": 7031
+      },
+      {
+        "producer_throughput_mbps": 318.17,
+        "consumer_throughput_mbps": 318.17,
+        "producer_bytes": 20021343598,
+        "consumer_bytes": 20021343598,
+        "producer_messages": 6955,
+        "consumer_messages": 6955
+      }
+    ],
+    "producer_mean": 318.2766666666667,
+    "producer_stddev": 3.3912583701825834,
+    "consumer_mean": 318.22333333333336,
+    "consumer_stddev": 3.3203212695962554
+  },
+  "shm": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 488.12,
+        "consumer_throughput_mbps": 477.13,
+        "producer_bytes": 30711767013,
+        "consumer_bytes": 30711767013,
+        "producer_messages": 10622,
+        "consumer_messages": 10622
+      },
+      {
+        "producer_throughput_mbps": 495.86,
+        "consumer_throughput_mbps": 499.25,
+        "producer_bytes": 31196927703,
+        "consumer_bytes": 31196927703,
+        "producer_messages": 10883,
+        "consumer_messages": 10883
+      },
+      {
+        "producer_throughput_mbps": 490.65,
+        "consumer_throughput_mbps": 493.76,
+        "producer_bytes": 30870758586,
+        "consumer_bytes": 30870758586,
+        "producer_messages": 10755,
+        "consumer_messages": 10755
+      }
+    ],
+    "producer_mean": 491.54333333333335,
+    "producer_stddev": 3.9465723524766902,
+    "consumer_mean": 490.0466666666667,
+    "consumer_stddev": 11.518039474378153
+  },
+  "speedup": 1.5399457404129175
+}

@@ -66,6 +66,79 @@ Sentinel bytes (0x00) before and after payload detect
 buffer overruns and data corruption during read.
 ```
 
+## End-of-Stream Signaling
+
+The ring buffer supports explicit end-of-stream (EOS) notification to signal 
+when the producer has finished sending data.
+
+**EOS Marker:**
+- A slot with `payload_size == 0` is used as the end-of-stream marker
+- Producer sends EOS by calling `close()` method (automatically pushes EOS marker)
+- Consumer detects EOS when `pop()` returns `None`/`nullopt`
+
+**Producer Side:**
+```python
+# Python
+producer = SharedRingBufferProducer("buffer", 1024*1024*100)
+producer.push(data)
+# ... send more data ...
+producer.close()  # Automatically sends EOS marker
+```
+
+```cpp
+// C++
+auto producer = SharedRingBufferProducer("buffer", 1024*1024*100);
+producer.push(data);
+// ... send more data ...
+producer.close();  // Automatically sends EOS marker
+```
+
+**Consumer Side:**
+```python
+# Python
+consumer = SharedRingBufferConsumer("buffer", 1024*1024*100)
+while True:
+    try:
+        payload = consumer.pop()
+        if payload is None:  # End-of-stream
+            break
+        # Process payload...
+    except RingBufferException as e:
+        # Handle errors (timeout, corruption, etc.)
+        print(f"Error: {e.error_type}")
+        break
+```
+
+```cpp
+// C++
+auto consumer = SharedRingBufferConsumer("buffer", 1024*1024*100);
+while (true) {
+    try {
+        auto payload = consumer.pop();
+        if (!payload) {  // End-of-stream
+            break;
+        }
+        // Process payload...
+    } catch (const RingBufferException& e) {
+        // Handle errors (timeout, corruption, etc.)
+        std::cerr << "Error: " << e.what() << std::endl;
+        break;
+    }
+}
+```
+
+**Error Handling:**
+- `pop()` returns `None`/`nullopt` **only** for end-of-stream
+- All error conditions (timeout, corruption, etc.) throw `RingBufferException`
+- Exception contains `error_type` field for precise error identification
+- Error types: NotInitialized, Timeout, BufferEmpty, CorruptPayload, 
+  DeserializationFailed, InvalidMetadata, ShmNotFound, SizeMismatch
+
+**Performance Impact:**
+- EOS detection adds minimal overhead: 20 bytes read + 1 comparison per slot
+- No format changes or additional flags required
+- Early exit before reading payload when EOS detected
+
 ## Object Serialization Flow
 
 ```

@@ -282,7 +282,7 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     std::optional<std::chrono::milliseconds> timeout
 ) {
     if (!shm_ptr_) {
-        return std::nullopt;
+        throw RingBufferException(RingBufferError::NotInitialized);
     }
     
     // Wait for data if blocking
@@ -297,13 +297,13 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
         }
         
         if (!blocking_) {
-            return std::nullopt;
+            throw RingBufferException(RingBufferError::BufferEmpty);
         }
         
         if (timeout.has_value()) {
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed >= *timeout) {
-                return std::nullopt;
+                throw RingBufferException(RingBufferError::Timeout);
             }
         }
         
@@ -324,13 +324,22 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     
     // Validate metadata size
     if (metadata_size > MAX_METADATA_SIZE) {
-        std::cerr << "Invalid metadata_size: " << metadata_size << std::endl;
-        return std::nullopt;
+        throw RingBufferException(RingBufferError::InvalidMetadata, 
+            "Invalid metadata_size: " + std::to_string(metadata_size) + " > " + std::to_string(MAX_METADATA_SIZE));
     }
     
     // Read payload_size (8 bytes)
     uint64_t payload_size = read_uint64(current_pos);
     current_pos = advance_pos(current_pos, 8);
+    
+    // Check for end-of-stream marker (payload_size == 0)
+    if (payload_size == 0) {
+        eos_received_ = true;
+        std::cout << "Received end-of-stream marker" << std::endl;
+        // Update read_offset to consume the EOS slot
+        set_read_offset(next_offset);
+        return std::nullopt;
+    }
     
     // Read metadata JSON
     auto metadata_bytes = read_bytes(current_pos, metadata_size);
@@ -339,19 +348,16 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     // Parse metadata
     auto metadata_result = parse_metadata(metadata_bytes);
     if (!metadata_result) {
-        std::cerr << "Failed to parse metadata" << std::endl;
-        return std::nullopt;
+        throw RingBufferException(RingBufferError::InvalidMetadata, "Failed to parse metadata JSON");
     }
     
     // Read and verify start sentinel
     auto start_sentinel = read_bytes(current_pos, 1);
     if (start_sentinel.empty() || start_sentinel[0] != SENTINEL_BYTE) {
-        std::cerr << "Data corruption: invalid start sentinel (expected " 
-                  << static_cast<int>(SENTINEL_BYTE) << ", got " 
-                  << (start_sentinel.empty() ? "empty" : std::to_string(start_sentinel[0])) 
-                  << ")" << std::endl;
         last_error_ = RingBufferError::CorruptPayload;
-        return std::nullopt;
+        throw RingBufferException(RingBufferError::CorruptPayload, 
+            "Invalid start sentinel (expected " + std::to_string(static_cast<int>(SENTINEL_BYTE)) + 
+            ", got " + (start_sentinel.empty() ? "empty" : std::to_string(start_sentinel[0])) + ")");
     }
     current_pos = advance_pos(current_pos, 1);
     
@@ -362,12 +368,10 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     // Read and verify end sentinel
     auto end_sentinel = read_bytes(current_pos, 1);
     if (end_sentinel.empty() || end_sentinel[0] != SENTINEL_BYTE) {
-        std::cerr << "Data corruption: invalid end sentinel (expected " 
-                  << static_cast<int>(SENTINEL_BYTE) << ", got " 
-                  << (end_sentinel.empty() ? "empty" : std::to_string(end_sentinel[0])) 
-                  << ")" << std::endl;
         last_error_ = RingBufferError::CorruptPayload;
-        return std::nullopt;
+        throw RingBufferException(RingBufferError::CorruptPayload,
+            "Invalid end sentinel (expected " + std::to_string(static_cast<int>(SENTINEL_BYTE)) + 
+            ", got " + (end_sentinel.empty() ? "empty" : std::to_string(end_sentinel[0])) + ")");
     }
     
     // Deserialize using the SerializableObject factory
@@ -375,8 +379,7 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     
     // Check if deserialization succeeded
     if (!deserialized) {
-        std::cerr << "Failed to deserialize object" << std::endl;
-        return std::nullopt;
+        throw RingBufferException(RingBufferError::DeserializationFailed);
     }
     
     // Update read_offset
@@ -642,7 +645,17 @@ bool SharedRingBufferProducer::write_slot(
     
     return true;
 }
-
+void SharedRingBufferProducer::close() {
+    if (shm_ptr_ != nullptr) {
+        // Push end-of-stream marker (empty metadata + empty payload)
+        try {
+            std::vector<uint8_t> empty_payload;
+            push_raw("{}", empty_payload, 5000);  // 5 second timeout
+        } catch (...) {
+            // Ignore errors when sending EOS marker
+        }
+    }
+}
 bool SharedRingBufferProducer::push_raw(
     const std::string& metadata_json,
     const std::vector<uint8_t>& payload,
