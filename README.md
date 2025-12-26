@@ -13,7 +13,8 @@ Zero-copy (0CP) inter-process communication (IPC): A library for exchanging data
 - **Variable-size slots**: Efficient memory usage with support for objects of different sizes
 - **Generic object support**: Exchange NumPy arrays, PIL Images, text, JSON, and raw bytes
 - **Blocking/non-blocking modes**: Configurable wait behavior for producer and consumer
-- **Simple API**: Easy-to-use Python interface with planned C++ integration
+- **Simple API**: Easy-to-use Python interface with C++20 consumer implementation
+- **Cross-language IPC**: Python producer can communicate with C++ consumer and vice versa
 
 ## Python Ring Buffer
 
@@ -74,9 +75,15 @@ buffer.unlink()  # Cleanup
 
 ### Architecture
 
-The ring buffer uses a hybrid linked-list design:
-- **Header**: Contains `write_offset` and `read_offset` for O(1) space checking
-- **Variable slots**: Each slot stores `next_offset`, JSON metadata (max 1024 bytes), and payload
+The ring buffer uses a hybrid linked-list design with data integrity checking:
+- **Header (24 bytes)**: Contains `write_offset`, `read_offset`, and `total_data_bytes` for O(1) space checking
+- **Variable slots**: Each slot contains:
+  - **Slot header (20 bytes)**: `next_offset` (8 bytes), `metadata_size` (4 bytes), `payload_size` (8 bytes)
+  - **Metadata**: JSON metadata (max 1024 bytes)
+  - **Start sentinel (1 byte)**: Null byte (0x00) for integrity checking
+  - **Payload**: Binary data
+  - **End sentinel (1 byte)**: Null byte (0x00) for integrity checking
+- **Sentinel bytes**: Null bytes before and after payload detect buffer overruns and data corruption
 - **Circular buffer**: Automatic wraparound for continuous operation
 - **Lock-free**: Single producer and single consumer operate without locks
 

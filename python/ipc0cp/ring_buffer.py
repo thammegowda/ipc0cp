@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Constants
 HEADER_SIZE = 24  # 3 * uint64: write_offset, read_offset, total_data_bytes
 SLOT_HEADER_SIZE = 20  # next_offset(8) + metadata_size(4) + payload_size(8)
+SENTINEL_BYTE = 0x00  # Null byte for data integrity checking (before and after payload)
 MAX_SLOT_SIZE = 10 * 1024 * 1024  # 10 MB
 DEFAULT_TOTAL_DATA_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
 
@@ -46,11 +47,16 @@ class SharedRingBufferBase(ABC):
         [Data Region: Slot0 → Slot1 → Slot2 → ...]
         
     Each Slot:
-        next_offset (uint64)
-        metadata_size (uint32)
-        payload_size (uint64)
+        next_offset (uint64, 8 bytes)
+        metadata_size (uint32, 4 bytes)
+        payload_size (uint64, 8 bytes)
         metadata_json (bytes, max 1024)
+        start_sentinel (uint8, 1 byte, value=0x00)
         payload (bytes)
+        end_sentinel (uint8, 1 byte, value=0x00)
+        
+    Sentinel bytes (0x00) before and after payload provide data integrity 
+    checking to detect buffer overruns and corruption.
         
     Supported object types:
         - NumPy arrays (type='ndarray')
@@ -83,6 +89,7 @@ class SharedRingBufferBase(ABC):
         self.blocking = blocking
         self.max_slot_size = max_slot_size
         self.shm: Optional[shared_memory.SharedMemory] = None
+        self.last_error: Optional[str] = None  # Track last error
         
         # Total shared memory size
         self.shm_size = HEADER_SIZE + total_data_bytes
@@ -292,6 +299,93 @@ class SharedRingBufferProducer(SharedRingBufferBase):
             logger.error(f"Failed to create shared memory: {e}")
             raise
     
+    def push_raw(self, metadata_json: str, payload: bytes, timeout: Optional[float] = None) -> bool:
+        """
+        Push pre-serialized data into the ring buffer.
+        
+        Args:
+            metadata_json: JSON metadata string
+            payload: Binary payload data
+            timeout: Maximum time to wait in seconds (None = infinite if blocking)
+            
+        Returns:
+            True if successful, False if buffer is full and non-blocking
+        """
+        if self.shm is None:
+            raise RuntimeError("Shared memory not initialized")
+        
+        metadata_bytes = metadata_json.encode('utf-8')
+        metadata_size = len(metadata_bytes)
+        
+        if metadata_size > MAX_METADATA_SIZE:
+            raise ValueError(f"Metadata size {metadata_size} exceeds maximum {MAX_METADATA_SIZE}")
+        
+        payload_size = len(payload)
+        slot_size = SLOT_HEADER_SIZE + metadata_size + 1 + payload_size + 1
+        
+        # Wait for space if blocking
+        start_time = time.time()
+        while True:
+            write_offset = self._get_write_offset()
+            read_offset = self._get_read_offset()
+            available = self._available_space(write_offset, read_offset)
+            
+            if available >= slot_size:
+                break
+            
+            if not self.blocking:
+                return False
+            
+            if timeout is not None and (time.time() - start_time) >= timeout:
+                return False
+            
+            time.sleep(0.0005)
+        
+        # Write slot
+        next_offset = write_offset + slot_size
+        next_offset = self._normalize_offset(next_offset)
+        
+        current_pos = write_offset
+        current_pos = self._write_uint64(current_pos, next_offset)
+        current_pos = self._write_uint32(current_pos, metadata_size)
+        current_pos = self._write_uint64(current_pos, payload_size)
+        current_pos = self._write_with_wrap(current_pos, metadata_bytes)
+        current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
+        current_pos = self._write_with_wrap(current_pos, payload)
+        current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
+        
+        self._set_write_offset(next_offset)
+        return True
+    
+    def available_space(self) -> int:
+        """
+        Get available space in buffer.
+        
+        Returns:
+            Available space in bytes
+        """
+        write_offset = self._get_write_offset()
+        read_offset = self._get_read_offset()
+        return self._available_space(write_offset, read_offset)
+    
+    def is_initialized(self) -> bool:
+        """
+        Check if shared memory is initialized.
+        
+        Returns:
+            True if initialized, False otherwise
+        """
+        return self.shm is not None
+    
+    def shm_name_value(self) -> str:
+        """
+        Get the shared memory name.
+        
+        Returns:
+            Shared memory segment name
+        """
+        return self.shm_name
+    
     def push(self, obj: Any, timeout: Optional[float] = None) -> bool:
         """
         Push an object into the ring buffer (producer operation).
@@ -307,29 +401,12 @@ class SharedRingBufferProducer(SharedRingBufferBase):
             ValueError: If object is too large or cannot be serialized
             RuntimeError: If shared memory is not initialized
         """
-        if self.shm is None:
-            raise RuntimeError("Shared memory not initialized")
-        
-        # Get serializer and serialize object
+        # Serialize object
         try:
             serializer = get_serializer(obj)
             metadata_dict, payload = serializer.serialize(obj)
         except Exception as e:
             raise ValueError(f"Failed to serialize object: {e}")
-        
-        # Convert metadata to JSON
-        try:
-            metadata_json = json.dumps(metadata_dict).encode('utf-8')
-        except Exception as e:
-            raise ValueError(f"Failed to encode metadata as JSON: {e}")
-        
-        # Validate metadata size
-        metadata_size = len(metadata_json)
-        if metadata_size > MAX_METADATA_SIZE:
-            raise ValueError(
-                f"Metadata size {metadata_size} bytes exceeds maximum "
-                f"{MAX_METADATA_SIZE} bytes"
-            )
         
         # Validate payload size
         payload_size = len(payload)
@@ -340,54 +417,14 @@ class SharedRingBufferProducer(SharedRingBufferBase):
             )
             return False
         
-        # Total slot size
-        slot_size = SLOT_HEADER_SIZE + metadata_size + payload_size
+        # Convert metadata to JSON
+        try:
+            metadata_json = json.dumps(metadata_dict)
+        except Exception as e:
+            raise ValueError(f"Failed to encode metadata as JSON: {e}")
         
-        # Wait for space if blocking
-        start_time = time.time()
-        while True:
-            write_offset = self._get_write_offset()
-            read_offset = self._get_read_offset()
-            
-            available = self._available_space(write_offset, read_offset)
-            
-            if available >= slot_size:
-                break
-            
-            if not self.blocking:
-                return False
-            
-            if timeout is not None and (time.time() - start_time) >= timeout:
-                return False
-            
-            time.sleep(0.0005)  # 500 microseconds
-        
-        # Calculate next_offset (where next slot would start)
-        next_offset = write_offset + slot_size
-        next_offset = self._normalize_offset(next_offset)
-        
-        # Write slot header and data
-        current_pos = write_offset
-        
-        # Write next_offset (8 bytes)
-        current_pos = self._write_uint64(current_pos, next_offset)
-        
-        # Write metadata_size (4 bytes)
-        current_pos = self._write_uint32(current_pos, metadata_size)
-        
-        # Write payload_size (8 bytes)
-        current_pos = self._write_uint64(current_pos, payload_size)
-        
-        # Write metadata JSON
-        current_pos = self._write_with_wrap(current_pos, metadata_json)
-        
-        # Write payload
-        current_pos = self._write_with_wrap(current_pos, payload)
-        
-        # Update write_offset atomically
-        self._set_write_offset(next_offset)
-        
-        return True
+        # Delegate to push_raw
+        return self.push_raw(metadata_json, payload, timeout)
 
 
 class SharedRingBufferConsumer(SharedRingBufferBase):
@@ -405,18 +442,21 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         total_data_bytes: int = DEFAULT_TOTAL_DATA_BYTES,
         blocking: bool = True,
         max_slot_size: int = MAX_SLOT_SIZE,
+        auto_attach: bool = True,
     ):
         """
-        Initialize the consumer and attach to existing shared memory.
+        Initialize the consumer and optionally attach to existing shared memory.
         
         Args:
             shm_name: Name of the POSIX shared memory segment
             total_data_bytes: Total size of the data region in bytes (should match producer)
             blocking: Whether to block when buffer is empty
             max_slot_size: Maximum allowed size per slot (default 10MB)
+            auto_attach: If True, automatically attach to shared memory in constructor
         """
         super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
-        self._attach()
+        if auto_attach:
+            self._attach()
     
     def _set_read_offset(self, offset: int):
         """Write read_offset to header."""
@@ -545,8 +585,24 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         except Exception as e:
             raise ValueError(f"Failed to parse metadata JSON: {e}")
         
+        # Read and verify start sentinel
+        start_sentinel = self._read_bytes(current_pos, 1)
+        if len(start_sentinel) != 1 or start_sentinel[0] != SENTINEL_BYTE:
+            error_msg = f"Data corruption: invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})"
+            self.last_error = error_msg
+            raise ValueError(error_msg)
+        current_pos = self._advance_pos(current_pos, 1)
+        
         # Read payload
         payload = self._read_bytes(current_pos, payload_size)
+        current_pos = self._advance_pos(current_pos, payload_size)
+        
+        # Read and verify end sentinel
+        end_sentinel = self._read_bytes(current_pos, 1)
+        if len(end_sentinel) != 1 or end_sentinel[0] != SENTINEL_BYTE:
+            error_msg = f"Data corruption: invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})"
+            self.last_error = error_msg
+            raise ValueError(error_msg)
         
         # Get object type and deserialize
         obj_type = metadata_dict.get('type')
@@ -558,7 +614,9 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         try:
             obj = serializer.deserialize(metadata_dict, payload)
         except Exception as e:
-            raise ValueError(f"Failed to deserialize object: {e}")
+            error_msg = f"Failed to deserialize object: {e}"
+            self.last_error = error_msg
+            raise ValueError(error_msg)
         
         # Update read_offset to next_offset
         self._set_read_offset(next_offset)

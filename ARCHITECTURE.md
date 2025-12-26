@@ -54,11 +54,16 @@ Producer (Process 1)          Consumer (Process 2)
 │  │      "dtype": "<u1"                            │  │
 │  │    }                                           │  │
 │  └────────────────────────────────────────────────┘  │
+│  start_sentinel  (1 byte)   ─────> 0x00 for integrity│
 │  ┌────────────────────────────────────────────────┐  │
 │  │    payload (variable size)                     │  │
 │  │    [ raw bytes of the object ]                 │  │
 │  └────────────────────────────────────────────────┘  │
+│  end_sentinel    (1 byte)   ─────> 0x00 for integrity│
 └──────────────────────────────────────────────────────┘
+
+Sentinel bytes (0x00) before and after payload detect
+buffer overruns and data corruption during read.
 ```
 
 ## Object Serialization Flow
