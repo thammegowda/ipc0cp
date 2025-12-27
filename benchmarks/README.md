@@ -66,6 +66,17 @@ python consumer.py --shm test_bench --duration 15
 python producer.py --shm test_bench --duration 10
 ```
 
+### C++ Benchmarks
+
+The STDIO API is also available as native C++ producers/consumers. Build them once (from the benchmarks directory) and then enable them in the Python harness:
+
+```bash
+cd benchmarks
+cmake -S . -B build
+cmake --build build
+python run_benchmark.py --include-cpp
+```
+
 ## Metrics
 
 The benchmark measures:
