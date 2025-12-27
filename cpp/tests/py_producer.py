@@ -11,9 +11,14 @@ import time
 import argparse
 import numpy as np
 from PIL import Image
+from pathlib import Path
+
+
+# <root>/cpp/tests/<me>.py
+root = Path(__file__).resolve().parent.parent.parent / 'python'
 
 # Add parent directory to path
-sys.path.insert(0, '/home/tg/work/me/ipc0cp/python')
+sys.path.insert(0, str(root))
 
 from ipc0cp import SharedRingBufferProducer
 

@@ -6,9 +6,16 @@
  * for IPC. While not zero-copy like shared memory, it's portable and works across
  * different process boundaries (e.g., network, containers).
  * 
- * Wire Format:
- *     [length: 8 bytes little-endian][payload: length bytes]
- *     length=0 signals end-of-stream
+ * Wire Format (per message):
+ *     [metadata_size: 4 bytes little-endian uint32]
+ *     [payload_size:  8 bytes little-endian uint64]
+ *     [metadata_json: metadata_size bytes (UTF-8)]
+ *     [start_sentinel: 1 byte]
+ *     [payload: payload_size bytes]
+ *     [end_sentinel: 1 byte]
+ *
+ * End-of-stream:
+ *     metadata_size=0 and payload_size=0
  */
 
 #pragma once
@@ -27,7 +34,7 @@ namespace ipc0cp {
  * @brief Producer that writes serialized objects to stdout
  * 
  * Uses the same serialization format as SharedRingBufferProducer for consistency.
- * Wire format: [length:8 bytes][metadata_json + payload]
+ * Wire format: [metadata_size:4][payload_size:8][metadata_json][sentinel][payload][sentinel]
  * 
  * Example:
  * @code
@@ -71,7 +78,7 @@ public:
     bool push_raw(const std::string& metadata_json, const std::vector<uint8_t>& payload);
     
     /**
-     * @brief Send end-of-stream marker (length=0)
+     * @brief Send end-of-stream marker (metadata_size=0, payload_size=0)
      */
     void close();
     
@@ -89,7 +96,7 @@ private:
  * @brief Consumer that reads serialized objects from stdin
  * 
  * Uses the same deserialization format as SharedRingBufferConsumer for consistency.
- * Wire format: [length:8 bytes][metadata_json + payload]
+ * Wire format: [metadata_size:4][payload_size:8][metadata_json][sentinel][payload][sentinel]
  * 
  * Example:
  * @code

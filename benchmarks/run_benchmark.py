@@ -11,7 +11,9 @@ import subprocess
 import sys
 import time
 from typing import List, Dict
+from pathlib import Path
 
+MYDIR = Path(__file__).resolve().parent
 
 def run_stdio_benchmark(duration: float, min_size: int, max_size: int) -> Dict:
     """
@@ -285,7 +287,7 @@ def main():
         'speedup': speedup,
     }
     
-    output_file = f"benchmark_results_{int(time.time())}.json"
+    output_file = MYDIR / f"benchmark_results_{int(time.time())}.json"
     with open(output_file, 'w') as f:
         json.dump(results, f, indent=2)
     

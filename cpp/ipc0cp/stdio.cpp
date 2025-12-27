@@ -6,7 +6,15 @@
 #include "stdio.hpp"
 #include <cstring>
 #include <stdexcept>
-#include <nlohmann/json.hpp>
+
+namespace {
+
+bool read_exact(std::istream& in, void* dst, size_t len) {
+    in.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(len));
+    return static_cast<size_t>(in.gcount()) == len;
+}
+
+} // namespace
 
 namespace ipc0cp {
 
@@ -36,17 +44,35 @@ bool StdioProducer::push_raw(const std::string& metadata_json, const std::vector
     }
     
     try {
-        // Combine metadata and payload
-        std::vector<uint8_t> combined;
-        combined.insert(combined.end(), metadata_json.begin(), metadata_json.end());
-        combined.insert(combined.end(), payload.begin(), payload.end());
-        
-        // Write length (8 bytes, little-endian)
-        uint64_t length = combined.size();
-        output_->write(reinterpret_cast<const char*>(&length), sizeof(length));
-        
-        // Write combined data
-        output_->write(reinterpret_cast<const char*>(combined.data()), combined.size());
+        if (metadata_json.size() > MAX_METADATA_SIZE) {
+            throw IPCException(
+                IPCError::InvalidMetadata,
+                "Metadata too large: " + std::to_string(metadata_json.size()) + " > " + std::to_string(MAX_METADATA_SIZE)
+            );
+        }
+
+        const uint32_t metadata_size = static_cast<uint32_t>(metadata_json.size());
+        const uint64_t payload_size = static_cast<uint64_t>(payload.size());
+
+        uint8_t metadata_buf[4];
+        write_le32(metadata_buf, metadata_size);
+        output_->write(reinterpret_cast<const char*>(metadata_buf), sizeof(metadata_buf));
+
+        uint8_t payload_buf[8];
+        write_le64(payload_buf, payload_size);
+        output_->write(reinterpret_cast<const char*>(payload_buf), sizeof(payload_buf));
+
+        if (metadata_size > 0) {
+            output_->write(metadata_json.data(), static_cast<std::streamsize>(metadata_size));
+        }
+
+        // Sentinels + payload
+        const char sentinel = static_cast<char>(SENTINEL_BYTE);
+        output_->write(&sentinel, 1);
+        if (payload_size > 0) {
+            output_->write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload_size));
+        }
+        output_->write(&sentinel, 1);
         output_->flush();
         
         if (!output_->good()) {
@@ -71,9 +97,11 @@ bool StdioProducer::push_raw(const std::string& metadata_json, const std::vector
 void StdioProducer::close() {
     if (!closed_) {
         try {
-            // Send EOS marker (length=0)
-            uint64_t length = 0;
-            output_->write(reinterpret_cast<const char*>(&length), sizeof(length));
+            // Send EOS marker (metadata_size=0, payload_size=0)
+            uint8_t eos[12];
+            write_le32(eos, 0);
+            write_le64(eos + 4, 0);
+            output_->write(reinterpret_cast<const char*>(eos), sizeof(eos));
             output_->flush();
         } catch (...) {
             // Ignore errors when sending EOS
@@ -124,112 +152,100 @@ StdioConsumer::pop_raw(int timeout_ms) {
     }
     
     try {
-        // Read length (8 bytes, little-endian)
-        uint64_t length;
-        input_->read(reinterpret_cast<char*>(&length), sizeof(length));
-        
-        if (input_->eof() && input_->gcount() == 0) {
-            // EOF without EOS marker
+        // Read metadata_size (4 bytes little-endian)
+        uint8_t meta_size_b[4];
+        if (!read_exact(*input_, meta_size_b, sizeof(meta_size_b))) {
+            if (input_->eof() && input_->gcount() == 0) {
+                // EOF without EOS marker
+                eos_received_ = true;
+                return std::nullopt;
+            }
+            throw IPCException(
+                IPCError::CorruptPayload,
+                "Incomplete metadata_size field: got " + std::to_string(input_->gcount()) + " bytes"
+            );
+        }
+
+        // Read payload_size (8 bytes little-endian)
+        uint8_t payload_size_b[8];
+        if (!read_exact(*input_, payload_size_b, sizeof(payload_size_b))) {
+            throw IPCException(
+                IPCError::CorruptPayload,
+                "Incomplete payload_size field: got " + std::to_string(input_->gcount()) + " bytes"
+            );
+        }
+
+        const uint32_t metadata_size = read_le32(meta_size_b);
+        const uint64_t payload_size = read_le64(payload_size_b);
+
+        // EOS marker
+        if (metadata_size == 0 && payload_size == 0) {
             eos_received_ = true;
             return std::nullopt;
         }
-        
-        if (input_->gcount() != sizeof(length)) {
+
+        if (metadata_size > MAX_METADATA_SIZE) {
             throw IPCException(
                 IPCError::CorruptPayload,
-                "Incomplete length field: got " + std::to_string(input_->gcount()) + " bytes"
+                "Invalid metadata_size: " + std::to_string(metadata_size)
             );
         }
-        
-        // Check for EOS marker
-        if (length == 0) {
-            eos_received_ = true;
-            return std::nullopt;
+
+        std::string metadata_json;
+        metadata_json.resize(metadata_size);
+        if (metadata_size > 0) {
+            if (!read_exact(*input_, metadata_json.data(), metadata_size)) {
+                throw IPCException(
+                    IPCError::CorruptPayload,
+                    "Incomplete metadata: expected " + std::to_string(metadata_size) +
+                        " bytes, got " + std::to_string(input_->gcount())
+                );
+            }
         }
-        
-        // Read combined metadata + payload
-        std::vector<uint8_t> combined(length);
-        input_->read(reinterpret_cast<char*>(combined.data()), length);
-        
-        if (static_cast<uint64_t>(input_->gcount()) != length) {
+
+        // Start sentinel
+        char start_sentinel;
+        if (!read_exact(*input_, &start_sentinel, 1)) {
             throw IPCException(
                 IPCError::CorruptPayload,
-                "Incomplete payload: expected " + std::to_string(length) + 
-                " bytes, got " + std::to_string(input_->gcount())
+                "Incomplete start sentinel"
             );
         }
-        
-        // Split metadata and payload
-        // The combined format is: metadata_json (UTF-8 text) + payload (binary)
-        // Find the end of JSON by parsing
-        std::string combined_str(combined.begin(), combined.end());
-        
-        // Parse JSON to find its end
-        try {
-            auto json_obj = nlohmann::json::parse(combined_str.begin(), combined_str.end(), nullptr, false);
-            if (json_obj.is_discarded()) {
-                throw IPCException(
-                    IPCError::InvalidMetadata,
-                    "Failed to parse metadata JSON"
-                );
-            }
-            
-            // Find where JSON ends (simple heuristic: find closing brace/bracket at top level)
-            size_t json_end = 0;
-            int depth = 0;
-            bool in_string = false;
-            bool escape = false;
-            
-            for (size_t i = 0; i < combined.size(); ++i) {
-                char c = combined[i];
-                
-                if (escape) {
-                    escape = false;
-                    continue;
-                }
-                
-                if (c == '\\') {
-                    escape = true;
-                    continue;
-                }
-                
-                if (c == '"' && !escape) {
-                    in_string = !in_string;
-                    continue;
-                }
-                
-                if (in_string) continue;
-                
-                if (c == '{' || c == '[') depth++;
-                if (c == '}' || c == ']') {
-                    depth--;
-                    if (depth == 0) {
-                        json_end = i + 1;
-                        break;
-                    }
-                }
-            }
-            
-            if (json_end == 0) {
-                throw IPCException(
-                    IPCError::InvalidMetadata,
-                    "Could not find end of JSON metadata"
-                );
-            }
-            
-            std::string metadata_json(combined.begin(), combined.begin() + json_end);
-            std::vector<uint8_t> payload(combined.begin() + json_end, combined.end());
-            
-            return std::make_pair(metadata_json, payload);
-            
-        } catch (const IPCException&) {
-            throw;
-        } catch (const std::exception& e) {
+        if (static_cast<uint8_t>(start_sentinel) != SENTINEL_BYTE) {
             throw IPCException(
-                IPCError::InvalidMetadata,
-                std::string("Failed to parse metadata: ") + e.what()
+                IPCError::CorruptPayload,
+                "Invalid start sentinel"
             );
         }
+
+        std::vector<uint8_t> payload;
+        payload.resize(static_cast<size_t>(payload_size));
+        if (payload_size > 0) {
+            if (!read_exact(*input_, payload.data(), static_cast<size_t>(payload_size))) {
+                throw IPCException(
+                    IPCError::CorruptPayload,
+                    "Incomplete payload: expected " + std::to_string(payload_size) +
+                        " bytes, got " + std::to_string(input_->gcount())
+                );
+            }
+        }
+
+        // End sentinel
+        char end_sentinel;
+        if (!read_exact(*input_, &end_sentinel, 1)) {
+            throw IPCException(
+                IPCError::CorruptPayload,
+                "Incomplete end sentinel"
+            );
+        }
+        if (static_cast<uint8_t>(end_sentinel) != SENTINEL_BYTE) {
+            throw IPCException(
+                IPCError::CorruptPayload,
+                "Invalid end sentinel"
+            );
+        }
+
+        return std::make_pair(std::move(metadata_json), std::move(payload));
         
     } catch (const IPCException&) {
         throw;

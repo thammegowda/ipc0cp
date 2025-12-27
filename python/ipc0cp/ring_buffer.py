@@ -426,13 +426,13 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         """
         Close the producer by sending end-of-stream marker and closing shared memory.
         
-        The end-of-stream marker is a slot with payload_size=0, which signals
-        the consumer to stop reading.
+        The end-of-stream marker is a slot with metadata_size=0 and payload_size=0,
+        which signals the consumer to stop reading.
         """
         if self.shm is not None:
             # Push end-of-stream marker (empty metadata + empty payload)
             try:
-                self.push_raw("{}", b"", timeout=5.0)
+                self.push_raw("", b"", timeout=5.0)
                 logger.info("Sent end-of-stream marker")
             except Exception as e:
                 logger.warning(f"Failed to send end-of-stream marker: {e}")
@@ -593,8 +593,8 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         payload_size = self._read_uint64(current_pos)
         current_pos = self._advance_pos(current_pos, 8)
         
-        # Check for end-of-stream marker (payload_size == 0)
-        if payload_size == 0:
+        # Check for end-of-stream marker (metadata_size == 0 and payload_size == 0)
+        if metadata_size == 0 and payload_size == 0:
             self.eos_received = True
             logger.info("Received end-of-stream marker")
             # Update read_pos to consume the EOS slot
@@ -615,7 +615,6 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         # Parse metadata
         try:
             metadata_str = metadata_bytes.decode('utf-8')
-            metadata_dict = json.loads(metadata_str)
         except Exception as e:
             raise ValueError(f"Failed to parse metadata JSON: {e}")
         
@@ -640,9 +639,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         
         # Deserialize using metadata_str and payload
         try:
-            # Combine metadata and payload for deserialize_object
-            combined = metadata_str.encode('utf-8') + payload
-            obj = deserialize_object(combined)
+            obj = deserialize_object(metadata_str, payload)
         except Exception as e:
             error_msg = f"Failed to deserialize: {e}"
             self.last_error = error_msg

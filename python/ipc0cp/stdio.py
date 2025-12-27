@@ -1,20 +1,29 @@
-"""
-STDIO-based IPC using stdin/stdout for inter-process communication.
+"""STDIO-based IPC using stdin/stdout for inter-process communication.
 
 This module provides producer and consumer classes that use standard input/output
 for IPC. While not zero-copy like shared memory, it's portable and works across
 different process boundaries (e.g., network, containers).
 
-Wire Format:
-    [length: 8 bytes little-endian][payload: length bytes]
-    length=0 signals end-of-stream
+Wire Format (per message):
+    [metadata_size: 4 bytes little-endian uint32]
+    [payload_size:  8 bytes little-endian uint64]
+    [metadata_json: metadata_size bytes (UTF-8)]
+    [start_sentinel: 1 byte]
+    [payload:       payload_size bytes (binary)]
+    [end_sentinel:   1 byte]
+
+End-of-stream:
+    metadata_size=0 and payload_size=0
 """
 
 import sys
 import struct
 from typing import Any, Optional
-from .serialize import serialize_object, deserialize_object
+from .serialize import MAX_METADATA_SIZE, serialize_object, deserialize_object
 from .ipc import IPCException, IPCError
+
+
+SENTINEL_BYTE = 0x00
 
 
 class StdioProducer:
@@ -22,7 +31,7 @@ class StdioProducer:
     Producer that writes serialized objects to stdout.
     
     Uses the same serialization as SharedRingBufferProducer for consistency.
-    Wire format: [length:8 bytes][metadata+payload]
+    Wire format: [metadata_size:4][payload_size:8][metadata_json][payload]
     
     Example:
         producer = StdioProducer()
@@ -63,15 +72,23 @@ class StdioProducer:
         try:
             # Serialize object
             metadata_json, payload_bytes = serialize_object(obj)
-            
-            # Combine metadata and payload
-            metadata_encoded = metadata_json.encode('utf-8')
-            combined = metadata_encoded + payload_bytes
-            
-            # Write length + combined data
-            length = len(combined)
-            self.output.write(struct.pack('<Q', length))
-            self.output.write(combined)
+
+            metadata_bytes = metadata_json.encode('utf-8')
+            metadata_size = len(metadata_bytes)
+            if metadata_size > MAX_METADATA_SIZE:
+                raise ValueError(
+                    f"Metadata size {metadata_size} exceeds maximum {MAX_METADATA_SIZE}"
+                )
+
+            payload_size = len(payload_bytes)
+
+            # Write header + fields
+            self.output.write(struct.pack('<I', metadata_size))
+            self.output.write(struct.pack('<Q', payload_size))
+            self.output.write(metadata_bytes)
+            self.output.write(bytes([SENTINEL_BYTE]))
+            self.output.write(payload_bytes)
+            self.output.write(bytes([SENTINEL_BYTE]))
             self.output.flush()
             
             return True
@@ -84,11 +101,12 @@ class StdioProducer:
     
     def close(self):
         """
-        Send end-of-stream marker (length=0) and close the stream.
+        Send end-of-stream marker (metadata_size=0, payload_size=0).
         """
         if not self.closed:
             try:
                 # Send EOS marker
+                self.output.write(struct.pack('<I', 0))
                 self.output.write(struct.pack('<Q', 0))
                 self.output.flush()
             except Exception:
@@ -102,7 +120,7 @@ class StdioConsumer:
     Consumer that reads serialized objects from stdin.
     
     Uses the same deserialization as SharedRingBufferConsumer for consistency.
-    Wire format: [length:8 bytes][metadata+payload]
+    Wire format: [metadata_size:4][payload_size:8][metadata_json][payload]
     
     Example:
         consumer = StdioConsumer()
@@ -140,36 +158,70 @@ class StdioConsumer:
             return None
         
         try:
-            # Read length
-            length_bytes = self.input.read(8)
-            if len(length_bytes) == 0:
+            # Read header
+            metadata_size_bytes = self.input.read(4)
+            if len(metadata_size_bytes) == 0:
                 # EOF without EOS marker
                 self.eos_received = True
                 return None
-            
-            if len(length_bytes) != 8:
+
+            if len(metadata_size_bytes) != 4:
                 raise IPCException(
                     IPCError.CORRUPT_PAYLOAD,
-                    f"Incomplete length field: got {len(length_bytes)} bytes"
+                    f"Incomplete metadata_size field: got {len(metadata_size_bytes)} bytes"
                 )
-            
-            length = struct.unpack('<Q', length_bytes)[0]
-            
+
+            payload_size_bytes = self.input.read(8)
+            if len(payload_size_bytes) != 8:
+                raise IPCException(
+                    IPCError.CORRUPT_PAYLOAD,
+                    f"Incomplete payload_size field: got {len(payload_size_bytes)} bytes"
+                )
+
+            metadata_size = struct.unpack('<I', metadata_size_bytes)[0]
+            payload_size = struct.unpack('<Q', payload_size_bytes)[0]
+
             # Check for EOS marker
-            if length == 0:
+            if metadata_size == 0 and payload_size == 0:
                 self.eos_received = True
                 return None
-            
-            # Read combined metadata + payload
-            combined = self.input.read(length)
-            if len(combined) != length:
+
+            if metadata_size > MAX_METADATA_SIZE:
                 raise IPCException(
                     IPCError.CORRUPT_PAYLOAD,
-                    f"Incomplete payload: expected {length} bytes, got {len(combined)}"
+                    f"Invalid metadata_size: {metadata_size}"
                 )
-            
-            # Deserialize
-            obj = deserialize_object(combined)
+
+            metadata_bytes = self.input.read(metadata_size)
+            if len(metadata_bytes) != metadata_size:
+                raise IPCException(
+                    IPCError.CORRUPT_PAYLOAD,
+                    f"Incomplete metadata: expected {metadata_size} bytes, got {len(metadata_bytes)}"
+                )
+
+            start_sentinel = self.input.read(1)
+            if len(start_sentinel) != 1 or start_sentinel[0] != SENTINEL_BYTE:
+                raise IPCException(
+                    IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})"
+                )
+
+            payload = self.input.read(payload_size)
+            if len(payload) != payload_size:
+                raise IPCException(
+                    IPCError.CORRUPT_PAYLOAD,
+                    f"Incomplete payload: expected {payload_size} bytes, got {len(payload)}"
+                )
+
+            end_sentinel = self.input.read(1)
+            if len(end_sentinel) != 1 or end_sentinel[0] != SENTINEL_BYTE:
+                raise IPCException(
+                    IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})"
+                )
+
+            metadata_json = metadata_bytes.decode('utf-8')
+            obj = deserialize_object(metadata_json, payload)
             return obj
             
         except IPCException:
@@ -179,3 +231,5 @@ class StdioConsumer:
                 IPCError.DESERIALIZATION_FAILED,
                 f"Failed to deserialize object: {e}"
             )
+
+

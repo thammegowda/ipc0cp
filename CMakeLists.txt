@@ -135,7 +135,7 @@ if(BUILD_TESTS)
         )
         set_tests_properties(CrossLanguageTest PROPERTIES 
             TIMEOUT 30
-            ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+            ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python;CMAKE_BINARY_DIR=${CMAKE_BINARY_DIR}"
         )
     endif()
 endif()

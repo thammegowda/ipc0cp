@@ -375,62 +375,10 @@ def serialize_object(obj: Any) -> Tuple[str, bytes]:
         raise ValueError(f"No serializer found for type: {type(obj)}")
 
 
-def deserialize_object(combined: bytes) -> Any:
-    """
-    Deserialize from combined metadata+payload bytes.
-    
-    The combined format is metadata_json (UTF-8 text) + payload (binary).
-    This function finds where the JSON ends and splits appropriately.
-    
-    Args:
-        combined: Combined metadata+payload bytes
-        
-    Returns:
-        Deserialized Python object (numpy array, PIL Image, str, dict, etc.)
-    """
-    # Find the end of JSON by parsing
-    combined_str = combined.decode('utf-8', errors='ignore')
-    
-    # Parse JSON to find its end
-    depth = 0
-    in_string = False
-    escape = False
-    json_end = 0
-    
-    for i, c in enumerate(combined_str):
-        if escape:
-            escape = False
-            continue
-        
-        if c == '\\':
-            escape = True
-            continue
-        
-        if c == '"' and not escape:
-            in_string = not in_string
-            continue
-        
-        if in_string:
-            continue
-        
-        if c in ('{', '['):
-            depth += 1
-        elif c in ('}', ']'):
-            depth -= 1
-            if depth == 0:
-                json_end = i + 1
-                break
-    
-    if json_end == 0:
-        raise ValueError("Could not find end of JSON metadata")
-    
-    # Split metadata and payload
-    metadata_json = combined[:json_end].decode('utf-8')
-    payload = combined[json_end:]
-    
-    # Deserialize
+def deserialize_object(metadata_json: str, payload: bytes) -> Any:
+    """Deserialize from metadata JSON and payload."""
     obj = deserialize(metadata_json, payload)
-    
+
     # Convert to native Python types
     if isinstance(obj, NumpyArray):
         return obj.to_array()

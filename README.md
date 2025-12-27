@@ -109,16 +109,12 @@ ipc0cp/
 │   └── ipc0cp/              # Python package
 │       ├── __init__.py      # Package initialization
 │       ├── ring_buffer.py   # Lock-free ring buffer implementation
-│       └── tests/           # Test suite
-│           └── test_ring_buffer.py
+│       └ tests/           # Test suite
+│         └── test_ring_buffer.py
 ├── cpp/
 │   └── ipc0cp/              # C++ library (future)
 │       ├── ipc.hpp          # C++ header files
 │       └── ipc.cpp          # C++ implementation
-├── examples/                # Example scripts
-│   ├── producer_example.py
-│   ├── consumer_example.py
-│   └── README.md
 ├── CMakeLists.txt           # CMake build configuration
 ├── pyproject.toml           # Python project configuration
 ├── README.md                # This file

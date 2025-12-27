@@ -18,7 +18,7 @@ rm -f /dev/shm/${SHM_NAME} 2>/dev/null
 
 # Start Python producer in background (it creates the shared memory)
 echo "Starting Python producer in background..."
-python3 "${MYDIR}/../../python/ipc0cp/tests/test_py_producer_cpp_consumer.py" \
+python3 "${MYDIR}/py_producer.py" \
     --shm ${SHM_NAME} \
     -n ${NUM_OBJECTS} \
     --buffer-size ${BUFFER_SIZE} &
@@ -29,7 +29,7 @@ sleep 1
 
 # Start C++ consumer (it will attach and consume)
 echo "Starting C++ consumer..."
-"${MYDIR}/../../build/test_consumer" --shm ${SHM_NAME} --buffer-size ${BUFFER_SIZE}
+"${CMAKE_BINARY_DIR}/test_consumer" --shm ${SHM_NAME} --buffer-size ${BUFFER_SIZE}
 
 # Wait for producer to finish
 wait ${PRODUCER_PID}

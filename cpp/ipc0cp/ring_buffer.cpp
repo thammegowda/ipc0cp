@@ -4,7 +4,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <endian.h>
 #include <cstring>
 #include <thread>
 #include <stdexcept>
@@ -41,50 +40,6 @@ inline uint64_t to_abs_pos(uint64_t pos_or_rel, size_t total_data_bytes) {
     return normalize_abs(abs_pos, total_data_bytes);
 }
 
-// Read little-endian uint64 from memory (explicit byte-by-byte)
-uint64_t read_uint64_le(const void* ptr) {
-    const uint8_t* bytes = static_cast<const uint8_t*>(ptr);
-    return static_cast<uint64_t>(bytes[0]) |
-           (static_cast<uint64_t>(bytes[1]) << 8) |
-           (static_cast<uint64_t>(bytes[2]) << 16) |
-           (static_cast<uint64_t>(bytes[3]) << 24) |
-           (static_cast<uint64_t>(bytes[4]) << 32) |
-           (static_cast<uint64_t>(bytes[5]) << 40) |
-           (static_cast<uint64_t>(bytes[6]) << 48) |
-           (static_cast<uint64_t>(bytes[7]) << 56);
-}
-
-// Read little-endian uint32 from memory (explicit byte-by-byte)
-uint32_t read_uint32_le(const void* ptr) {
-    const uint8_t* bytes = static_cast<const uint8_t*>(ptr);
-    return static_cast<uint32_t>(bytes[0]) |
-           (static_cast<uint32_t>(bytes[1]) << 8) |
-           (static_cast<uint32_t>(bytes[2]) << 16) |
-           (static_cast<uint32_t>(bytes[3]) << 24);
-}
-
-// Write little-endian uint64 to memory (explicit byte-by-byte)
-void write_uint64_le(void* ptr, uint64_t value) {
-    uint8_t* bytes = static_cast<uint8_t*>(ptr);
-    bytes[0] = static_cast<uint8_t>(value);
-    bytes[1] = static_cast<uint8_t>(value >> 8);
-    bytes[2] = static_cast<uint8_t>(value >> 16);
-    bytes[3] = static_cast<uint8_t>(value >> 24);
-    bytes[4] = static_cast<uint8_t>(value >> 32);
-    bytes[5] = static_cast<uint8_t>(value >> 40);
-    bytes[6] = static_cast<uint8_t>(value >> 48);
-    bytes[7] = static_cast<uint8_t>(value >> 56);
-}
-
-// Write little-endian uint32 to memory (explicit byte-by-byte)
-void write_uint32_le(void* ptr, uint32_t value) {
-    uint8_t* bytes = static_cast<uint8_t*>(ptr);
-    bytes[0] = static_cast<uint8_t>(value);
-    bytes[1] = static_cast<uint8_t>(value >> 8);
-    bytes[2] = static_cast<uint8_t>(value >> 16);
-    bytes[3] = static_cast<uint8_t>(value >> 24);
-}
-
 } // anonymous namespace
 
 // SharedRingBufferBase implementation
@@ -106,12 +61,12 @@ SharedRingBufferBase::~SharedRingBufferBase() {
 
 uint64_t SharedRingBufferBase::get_write_pos() const {
     if (!shm_ptr_) return 0;
-    return read_uint64_le(shm_ptr_);
+    return read_le64(shm_ptr_);
 }
 
 uint64_t SharedRingBufferBase::get_read_pos() const {
     if (!shm_ptr_) return 0;
-    return read_uint64_le(static_cast<const uint8_t*>(shm_ptr_) + 8);
+    return read_le64(static_cast<const uint8_t*>(shm_ptr_) + 8);
 }
 
 size_t SharedRingBufferBase::available_space(uint64_t write_pos, uint64_t read_pos) const {
@@ -225,7 +180,7 @@ bool SharedRingBufferConsumer::attach() {
     }
     
     // Read and verify total_data_bytes from header
-    uint64_t stored_total = read_uint64_le(static_cast<const uint8_t*>(shm_ptr_) + 16);
+    uint64_t stored_total = read_le64(static_cast<const uint8_t*>(shm_ptr_) + 16);
     if (stored_total != total_data_bytes_) {
         IPC_LOG_WARNING("total_data_bytes mismatch: using stored value " << stored_total);
         total_data_bytes_ = stored_total;
@@ -238,18 +193,18 @@ bool SharedRingBufferConsumer::attach() {
 
 void SharedRingBufferConsumer::set_read_pos(uint64_t pos) {
     if (shm_ptr_) {
-        write_uint64_le(static_cast<uint8_t*>(shm_ptr_) + 8, pos);
+        write_le64(static_cast<uint8_t*>(shm_ptr_) + 8, pos);
     }
 }
 
 uint64_t SharedRingBufferConsumer::read_uint64(uint64_t pos) {
     auto bytes = read_bytes(pos, 8);
-    return read_uint64_le(bytes.data());
+    return read_le64(bytes.data());
 }
 
 uint32_t SharedRingBufferConsumer::read_uint32(uint64_t pos) {
     auto bytes = read_bytes(pos, 4);
-    return read_uint32_le(bytes.data());
+    return read_le32(bytes.data());
 }
 
 std::vector<uint8_t> SharedRingBufferConsumer::read_bytes(uint64_t pos, size_t length) {
@@ -369,8 +324,8 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     uint64_t payload_size = read_uint64(current_pos);
     current_pos = advance_pos(current_pos, 8);
     
-    // Check for end-of-stream marker (payload_size == 0)
-    if (payload_size == 0) {
+    // Check for end-of-stream marker (metadata_size == 0 && payload_size == 0)
+    if (metadata_size == 0 && payload_size == 0) {
         eos_received_ = true;
         IPC_LOG_INFO("Received end-of-stream marker");
         // Update read_pos to consume the EOS slot
@@ -553,9 +508,9 @@ bool SharedRingBufferProducer::init_shm(bool create_new) {
         auto* header = static_cast<uint8_t*>(shm_ptr_);
         // Positions are absolute within the mapped shared memory region.
         // Match Python: initial positions start at the beginning of the data region.
-        write_uint64_le(header + 0, data_begin_abs());  // write_pos
-        write_uint64_le(header + 8, data_begin_abs());  // read_pos
-        write_uint64_le(header + 16, total_data_bytes_);  // total_data_bytes
+        write_le64(header + 0, data_begin_abs());  // write_pos
+        write_le64(header + 8, data_begin_abs());  // read_pos
+        write_le64(header + 16, total_data_bytes_);  // total_data_bytes
         
         IPC_LOG_INFO("Created shared memory '" << shm_name_ << "' (" 
                   << shm_size_ << " bytes)");
@@ -568,17 +523,17 @@ bool SharedRingBufferProducer::init_shm(bool create_new) {
 
 uint64_t SharedRingBufferProducer::get_write_pos() const {
     if (!shm_ptr_) return 0;
-    return read_uint64_le(static_cast<const uint8_t*>(shm_ptr_));
+    return read_le64(static_cast<const uint8_t*>(shm_ptr_));
 }
 
 uint64_t SharedRingBufferProducer::get_read_pos() const {
     if (!shm_ptr_) return 0;
-    return read_uint64_le(static_cast<const uint8_t*>(shm_ptr_) + 8);
+    return read_le64(static_cast<const uint8_t*>(shm_ptr_) + 8);
 }
 
 void SharedRingBufferProducer::set_write_pos(uint64_t pos) {
     if (shm_ptr_) {
-        write_uint64_le(static_cast<uint8_t*>(shm_ptr_), pos);
+        write_le64(static_cast<uint8_t*>(shm_ptr_), pos);
     }
 }
 
@@ -630,9 +585,9 @@ bool SharedRingBufferProducer::write_slot(
     
     // Write slot header
     uint8_t slot_header[SLOT_HEADER_SIZE];
-    write_uint64_le(slot_header, next_pos);
-    write_uint32_le(slot_header + 8, metadata_size);
-    write_uint64_le(slot_header + 12, payload_size);
+    write_le64(slot_header, next_pos);
+    write_le32(slot_header + 8, metadata_size);
+    write_le64(slot_header + 12, payload_size);
     
     auto advance_abs = [&](uint64_t pos, uint64_t delta) -> uint64_t {
         return normalize_abs(pos + delta, total_data_bytes_);
@@ -671,7 +626,7 @@ void SharedRingBufferProducer::close() {
         // Push end-of-stream marker (empty metadata + empty payload)
         try {
             std::vector<uint8_t> empty_payload;
-            push_raw("{}", empty_payload, 5000);  // 5 second timeout
+            push_raw("", empty_payload, 5000);  // 5 second timeout
         } catch (...) {
             // Ignore errors when sending EOS marker
         }
