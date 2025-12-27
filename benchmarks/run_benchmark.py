@@ -472,8 +472,6 @@ def main() -> None:
     # C++ benchmarks are enabled by default.
     parser.add_argument('--no-cpp', action='store_true',
                         help='Disable C++ benchmarks (Python-only)')
-    # Backward-compat alias; has no effect because C++ is on by default.
-    parser.add_argument('--include-cpp', action='store_true', help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
