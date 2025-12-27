@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ipc.hpp"
 #include "serialize.hpp"
 #include <string>
 #include <cstdint>
@@ -12,67 +13,23 @@
 
 namespace ipc0cp {
 
-/**
- * @brief Error types for ring buffer operations
- */
-enum class RingBufferError {
-    None,
-    NotInitialized,
-    ShmNotFound,
-    SizeMismatch,
-    InvalidMetadata,
-    InvalidSlot,
-    Timeout,
-    BufferEmpty,
-    DeserializationFailed,
-    CorruptPayload
-};
-
-/**
- * @brief Convert error to string
- */
-inline std::string errorToString(RingBufferError error) {
-    switch (error) {
-        case RingBufferError::None: return "No error";
-        case RingBufferError::NotInitialized: return "Shared memory not initialized";
-        case RingBufferError::ShmNotFound: return "Shared memory segment not found";
-        case RingBufferError::SizeMismatch: return "Shared memory size mismatch";
-        case RingBufferError::InvalidMetadata: return "Invalid metadata";
-        case RingBufferError::InvalidSlot: return "Invalid slot data";
-        case RingBufferError::Timeout: return "Operation timed out";
-        case RingBufferError::BufferEmpty: return "Buffer is empty";
-        case RingBufferError::DeserializationFailed: return "Deserialization failed";
-        case RingBufferError::CorruptPayload: return "Corrupt payload: sentinel bytes mismatch";
-        default: return "Unknown error";
-    }
-}
-
-/**
- * @brief Exception class for ring buffer errors
- */
-class RingBufferException : public std::runtime_error {
-public:
-    RingBufferError error_type;
-    
-    explicit RingBufferException(RingBufferError error) 
-        : std::runtime_error(errorToString(error)), error_type(error) {}
-    
-    RingBufferException(RingBufferError error, const std::string& msg) 
-        : std::runtime_error(msg), error_type(error) {}
-};
+// Type aliases for backward compatibility
+using RingBufferError = IPCError;
+using RingBufferException = IPCException;
+using RingBufferObject = IPCObject;
 
 /**
  * Shared Ring Buffer Memory Layout
  * =================================
  * 
  * Header (24 bytes):
- *   - write_offset (uint64, 8 bytes): Offset where next slot will be written
- *   - read_offset (uint64, 8 bytes): Offset of next slot to read
+ *   - write_pos (uint64, 8 bytes): ABSOLUTE byte position (write position / location) of next slot
+ *   - read_pos (uint64, 8 bytes): ABSOLUTE byte position (read position / location) of next slot
  *   - total_data_bytes (uint64, 8 bytes): Total size of data region
  * 
  * Data Region (variable size):
  *   Each slot contains:
- *     - next_offset (uint64, 8 bytes): Offset of next slot
+ *     - next_pos (uint64, 8 bytes): ABSOLUTE byte position (next location) of next slot
  *     - metadata_size (uint32, 4 bytes): Size of JSON metadata
  *     - payload_size (uint64, 8 bytes): Size of payload data
  *     - metadata_json (variable, max 1024 bytes): JSON metadata
@@ -84,51 +41,18 @@ public:
  */
 
 // Constants matching Python implementation
-constexpr size_t HEADER_SIZE = 24;  // 3 * uint64: write_offset, read_offset, total_data_bytes
-constexpr size_t SLOT_HEADER_SIZE = 20;  // next_offset(8) + metadata_size(4) + payload_size(8)
+constexpr size_t HEADER_SIZE = 24;  // 3 * uint64: write_pos, read_pos, total_data_bytes
+constexpr size_t SLOT_HEADER_SIZE = 20;  // next_pos(8) + metadata_size(4) + payload_size(8)
 constexpr uint8_t SENTINEL_BYTE = 0x00;  // Null byte for data integrity checking (before and after payload)
 constexpr size_t MAX_METADATA_SIZE = 1024;
 constexpr size_t MAX_SLOT_SIZE = 10 * 1024 * 1024;  // 10 MB
 constexpr size_t DEFAULT_TOTAL_DATA_BYTES = 1024ULL * 1024 * 1024;  // 1 GB
 
 /**
- * @brief A generic object from the ring buffer with deserialized data
- */
-struct RingBufferObject {
-    std::unique_ptr<SerializableObject> data;
-    std::map<std::string, std::string> raw_metadata;  // Original metadata
-    
-    RingBufferObject() = default;
-    explicit RingBufferObject(std::unique_ptr<SerializableObject> d) 
-        : data(std::move(d)) {}
-    
-    ObjectType get_type() const { 
-        return data ? data->get_type() : ObjectType::Unknown; 
-    }
-    
-    // Helper accessor with dynamic_cast (throws std::bad_cast on failure)
-    template<typename T>
-        requires std::derived_from<T, SerializableObject>
-    T& as() {
-        auto* ptr = dynamic_cast<T*>(data.get());
-        if (!ptr) throw std::bad_cast();
-        return *ptr;
-    }
-    
-    template<typename T>
-        requires std::derived_from<T, SerializableObject>
-    const T& as() const {
-        auto* ptr = dynamic_cast<const T*>(data.get());
-        if (!ptr) throw std::bad_cast();
-        return *ptr;
-    }
-};
-
-/**
  * @brief Result type for operations that can fail
  */
 template<typename T>
-using Result = std::variant<T, RingBufferError>;
+using Result = std::variant<T, IPCError>;
 
 /**
  * @brief Base class for shared ring buffer
@@ -153,8 +77,8 @@ public:
      * @brief Get buffer statistics
      */
     struct Stats {
-        uint64_t write_offset;
-        uint64_t read_offset;
+        uint64_t write_pos;
+        uint64_t read_pos;
         size_t available_bytes;
         size_t used_bytes;
         size_t total_data_bytes;
@@ -166,11 +90,11 @@ public:
 protected:
     SharedRingBufferBase(std::string shm_name, size_t total_data_bytes, bool blocking);
     
-    // Offset operations
-    uint64_t get_write_offset() const;
-    uint64_t get_read_offset() const;
-    size_t available_space(uint64_t write_offset, uint64_t read_offset) const;
-    uint64_t normalize_offset(uint64_t offset) const;
+    // Position operations (ABSOLUTE positions within the mapped region)
+    uint64_t get_write_pos() const;
+    uint64_t get_read_pos() const;
+    size_t available_space(uint64_t write_pos, uint64_t read_pos) const;
+    uint64_t normalize_pos(uint64_t pos) const;
     
     // Utility
     bool is_empty() const;
@@ -219,12 +143,14 @@ public:
      * @param total_data_bytes Total size of data region (must match producer)
      * @param blocking Whether to block when buffer is empty
      * @param auto_attach If true, automatically attach to shared memory in constructor
+     * @param auto_unlink If true, automatically unlink (delete) shared memory when EOS is received
      */
     SharedRingBufferConsumer(
         std::string shm_name,
         size_t total_data_bytes = DEFAULT_TOTAL_DATA_BYTES,
         bool blocking = true,
-        bool auto_attach = true
+        bool auto_attach = true,
+        bool auto_unlink = true
     );
     
     /**
@@ -237,31 +163,32 @@ public:
     /**
      * @brief Get last error
      */
-    RingBufferError get_last_error() const { return last_error_; }
+    IPCError get_last_error() const { return last_error_; }
     
     /**
      * @brief Pop an object from the ring buffer
      * @param timeout Maximum time to wait in milliseconds (nullopt = infinite if blocking)
      * @return Deserialized object, or std::nullopt if end-of-stream marker received
-     * @throws RingBufferException with error_type indicating the error
+     * @throws IPCException with error_type indicating the error
      */
-    std::optional<RingBufferObject> pop(
+    std::optional<IPCObject> pop(
         std::optional<std::chrono::milliseconds> timeout = std::nullopt
     );
 
 private:
-    void set_read_offset(uint64_t offset);
+    void set_read_pos(uint64_t pos);
     uint64_t read_uint64(uint64_t pos);
     uint32_t read_uint32(uint64_t pos);
     std::vector<uint8_t> read_bytes(uint64_t pos, size_t length);
-    uint64_t advance_pos(uint64_t pos, size_t offset);
+    uint64_t advance_pos(uint64_t pos, size_t delta);
     
     std::optional<std::map<std::string, std::string>> parse_metadata(
         const std::vector<uint8_t>& metadata_bytes
     );
     
-    RingBufferError last_error_ = RingBufferError::NotInitialized;
+    IPCError last_error_ = IPCError::NotInitialized;
     bool eos_received_ = false;  ///< Track if end-of-stream was received
+    bool auto_unlink_ = true;  ///< Automatically unlink shared memory on EOS
 };
 
 /**
@@ -348,27 +275,23 @@ private:
     // Initialize shared memory
     bool init_shm(bool create_new);
     
-    // Get/set offsets
-    uint64_t get_write_offset() const;
-    uint64_t get_read_offset() const;
-    void set_write_offset(uint64_t offset);
+    // Get/set positions (ABSOLUTE positions within the mapped region)
+    uint64_t get_write_pos() const;
+    uint64_t get_read_pos() const;
+    void set_write_pos(uint64_t pos);
     
     // Calculate available space
-    size_t available_space(uint64_t write_offset, uint64_t read_offset) const;
+    size_t available_space(uint64_t write_pos, uint64_t read_pos) const;
     
     // Write slot to buffer
     bool write_slot(
         const std::string& metadata_json,
         const std::vector<uint8_t>& payload,
-        uint64_t write_offset
+        uint64_t write_pos
     );
     
     // Helper to write bytes at position
     void write_bytes(size_t pos, const void* data, size_t size);
-    
-    // Helper to write uint64 in little-endian
-    void write_uint64_le(uint8_t* ptr, uint64_t value);
-    void write_uint32_le(uint8_t* ptr, uint32_t value);
 };
 
 } // namespace ipc0cp

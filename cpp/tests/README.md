@@ -131,14 +131,14 @@ Average: 22.50 ms/object
 
 Both Python and C++ implementations use identical memory layouts:
 
-- **Header (24 bytes)**: `write_offset | read_offset | total_data_bytes`
-- **Slot Structure**: `next_offset(8) | metadata_size(4) | payload_size(8) | metadata_json | payload`
+- **Header (24 bytes)**: `write_pos | read_pos | total_data_bytes`
+- **Slot Structure**: `next_pos(8) | metadata_size(4) | payload_size(8) | metadata_json | payload`
 - **Little-endian**: All multi-byte integers stored in little-endian format
 
 ### Thread Safety
 
 - Single producer / single consumer design (lock-free)
-- Atomic-like updates via proper offset management
+- Atomic-like updates via proper position management
 - No explicit synchronization primitives needed
 
 ## Troubleshooting

@@ -38,8 +38,8 @@ class TestSharedRingBufferCircular:
             
             # Verify we've wrapped around
             stats = producer.get_stats()
-            # After many operations, offsets should have wrapped
-            assert stats['write_offset'] != 24  # Not at initial position
+            # After many operations, positions should have wrapped
+            assert stats['write_pos'] != 24  # Not at initial position
         finally:
             consumer.close()
             producer.close()
@@ -60,14 +60,14 @@ class TestSharedRingBufferCircular:
         )
         
         try:
-            # Push and consume to move write_offset near the end
+            # Push and consume to move write_pos near the end
             images_pushed = []
             while True:
                 small_img = np.random.randint(0, 256, (16, 16, 3), dtype=np.uint8)
                 stats = producer.get_stats()
                 
                 # Stop when we're near the end
-                if stats['write_offset'] > 90 * 1024:
+                if stats['write_pos'] > 90 * 1024:
                     break
                 
                 if producer.push(small_img, timeout=0.1):

@@ -9,7 +9,7 @@
 │  ┌────────────────────────────────────────────────────┐    │
 │  │              Header (24 bytes)                      │    │
 │  │  ┌──────────────┬──────────────┬──────────────┐   │    │
-│  │  │ write_offset │ read_offset  │ total_bytes  │   │    │
+│  │  │ write_pos    │ read_pos     │ total_bytes  │   │    │
 │  │  │   (uint64)   │   (uint64)   │   (uint64)   │   │    │
 │  │  └──────────────┴──────────────┴──────────────┘   │    │
 │  └────────────────────────────────────────────────────┘    │
@@ -30,10 +30,10 @@
 
 Producer (Process 1)          Consumer (Process 2)
     │                              │
-    │  Writes at write_offset     │  Reads at read_offset
-    │  Updates write_offset ──────│────> Observes write_offset
-    │                              │  Updates read_offset
-    │  Observes read_offset <─────│
+    │  Writes at write_pos        │  Reads at read_pos
+    │  Updates write_pos ─────────│────> Observes write_pos
+    │                              │  Updates read_pos
+    │  Observes read_pos <────────│
     └──────────────────────────────┘
 ```
 
@@ -43,7 +43,7 @@ Producer (Process 1)          Consumer (Process 2)
 ┌──────────────────────────────────────────────────────┐
 │                    Single Slot                        │
 ├──────────────────────────────────────────────────────┤
-│  next_offset     (8 bytes)  ─────> Next slot offset  │
+│  next_pos        (8 bytes)  ─────> Next slot position│
 │  metadata_size   (4 bytes)  ─────> JSON metadata len │
 │  payload_size    (8 bytes)  ─────> Actual data len   │
 │  ┌────────────────────────────────────────────────┐  │
@@ -185,7 +185,7 @@ while (true) {
                            ▼
               ┌────────────────────────┐
               │  Write to shared mem:  │
-              │  1. next_offset        │
+              │  1. next_pos           │
               │  2. metadata_size      │
               │  3. payload_size       │
               │  4. metadata_json      │
@@ -194,7 +194,7 @@ while (true) {
                            │
                            ▼
               ┌────────────────────────┐
-              │  Update write_offset   │
+              │  Update write_pos      │
               │  (atomic operation)    │
               └────────────────────────┘
 
@@ -212,7 +212,7 @@ while (true) {
                            ▼
               ┌────────────────────────┐
               │  Read from shared mem: │
-              │  1. next_offset        │
+              │  1. next_pos           │
               │  2. metadata_size      │
               │  3. payload_size       │
               │  4. metadata_json      │
@@ -239,7 +239,7 @@ while (true) {
                            │
                            ▼
               ┌────────────────────────┐
-              │  Update read_offset    │
+              │  Update read_pos       │
               │  (atomic operation)    │
               └────────────────────────┘
                            │
@@ -256,38 +256,38 @@ Initial State:
 ┌────────────────────────────────────────┐
 │ [Header] |                    |        │
 │          ▲                              │
-│    read_offset                          │
-│    write_offset                         │
+│    read_pos                             │
+│    write_pos                            │
 └────────────────────────────────────────┘
 
 After Writing 3 Slots:
 ┌────────────────────────────────────────┐
 │ [Header] | S0 | S1 | S2 |      |      │
 │          ▲              ▲               │
-│    read_offset    write_offset         │
+│    read_pos       write_pos            │
 └────────────────────────────────────────┘
 
 After Consumer Reads 2:
 ┌────────────────────────────────────────┐
 │ [Header] | S0 | S1 | S2 |      |      │
 │                    ▲    ▲               │
-│              read_offset│               │
-│                   write_offset         │
+│              read_pos   │               │
+│                   write_pos            │
 └────────────────────────────────────────┘
 
 Buffer Nearly Full:
 ┌────────────────────────────────────────┐
 │ [Header] | S2 | S3 | S4 | S5 | S6 | S7│
 │                ▲                      ▲ │
-│          read_offset        write_offset│
+│          read_pos           write_pos   │
 └────────────────────────────────────────┘
 
 After Wraparound:
 ┌────────────────────────────────────────┐
 │ [Header] | S8 | S9 | S4 | S5 | S6 | S7│
 │               ▲   ▲                     │
-│         write_offset                    │
-│              read_offset                │
+│         write_pos                       │
+│              read_pos                   │
 └────────────────────────────────────────┘
   (S8, S9 overwrote S2, S3 after they were consumed)
 ```
@@ -296,26 +296,26 @@ After Wraparound:
 
 ```
 Producer Operations:
-1. Read read_offset (consumer's position)
-2. Read write_offset (own position)
+1. Read read_pos (consumer's position)
+2. Read write_pos (own position)
 3. Calculate available space
 4. If space available:
    - Write slot data
-   - Update write_offset (atomic)
+    - Update write_pos (atomic)
 5. Else:
    - Wait (blocking) or return False (non-blocking)
 
 Consumer Operations:
-1. Read write_offset (producer's position)
-2. Read read_offset (own position)
-3. If data available (write_offset != read_offset):
+1. Read write_pos (producer's position)
+2. Read read_pos (own position)
+3. If data available (write_pos != read_pos):
    - Read slot data
-   - Update read_offset (atomic)
+    - Update read_pos (atomic)
 4. Else:
    - Wait (blocking) or return None (non-blocking)
 
 Key Properties:
-✓ Each process only writes its own offset
+✓ Each process only writes its own position
 ✓ No locks needed (single producer, single consumer)
 ✓ Memory barriers implicit in Python (GIL)
 ✓ Wraparound handled transparently

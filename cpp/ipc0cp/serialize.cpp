@@ -1,4 +1,5 @@
 #include "serialize.hpp"
+#include "logger.hpp"
 #include <sstream>
 #include <algorithm>
 #include <cctype>
@@ -243,7 +244,7 @@ std::unique_ptr<ImageData> ImageData::deserialize(
         image->width = width;
         image->height = height;
     } else {
-        std::cerr << "Image missing size" << std::endl;
+        IPC_LOG_ERROR("Image missing size");
         return nullptr;
     }
     
@@ -281,7 +282,7 @@ std::unique_ptr<NumpyArray> NumpyArray::deserialize(
     if (shape_it != metadata.end()) {
         array->shape = SerializerUtils::parse_shape(shape_it->second);
     } else {
-        std::cerr << "NumPy array missing shape" << std::endl;
+        IPC_LOG_ERROR("NumPy array missing shape");
         return nullptr;
     }
     
@@ -290,7 +291,7 @@ std::unique_ptr<NumpyArray> NumpyArray::deserialize(
     if (dtype_it != metadata.end()) {
         array->dtype = dtype_it->second;
     } else {
-        std::cerr << "NumPy array missing dtype" << std::endl;
+        IPC_LOG_ERROR("NumPy array missing dtype");
         return nullptr;
     }
     
@@ -313,6 +314,28 @@ SerializedData NumpyArray::serialize() const {
     result.payload = bytes;  // bytes contains array data
     
     return result;
+}
+
+// Global deserialize function
+std::unique_ptr<SerializableObject> deserialize(
+    const std::string& metadata_json,
+    const std::vector<uint8_t>& payload
+) {
+    // Parse metadata JSON
+    json metadata = json::parse(metadata_json);
+    
+    // Convert JSON to map<string, string>
+    std::map<std::string, std::string> metadata_map;
+    for (auto& [key, value] : metadata.items()) {
+        if (value.is_string()) {
+            metadata_map[key] = value.get<std::string>();
+        } else {
+            metadata_map[key] = value.dump();
+        }
+    }
+    
+    // Use SerializableObject::deserialize
+    return SerializableObject::deserialize(metadata_map, payload);
 }
 
 } // namespace ipc0cp

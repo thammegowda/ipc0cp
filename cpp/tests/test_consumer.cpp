@@ -152,8 +152,8 @@ int main(int argc, char* argv[]) {
     // Print final stats
     auto stats = consumer.get_stats();
     std::cout << "\nFinal buffer stats:" << std::endl;
-    std::cout << "  Write offset: " << stats.write_offset << std::endl;
-    std::cout << "  Read offset: " << stats.read_offset << std::endl;
+    std::cout << "  Write pos: " << stats.write_pos << std::endl;
+    std::cout << "  Read pos: " << stats.read_pos << std::endl;
     std::cout << "  Available: " << stats.available_bytes << " bytes" << std::endl;
     std::cout << "  Used: " << stats.used_bytes << " bytes" << std::endl;
     std::cout << "  Empty: " << (stats.is_empty ? "yes" : "no") << std::endl;

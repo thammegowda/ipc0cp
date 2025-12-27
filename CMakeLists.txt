@@ -38,11 +38,14 @@ FetchContent_MakeAvailable(googletest)
 set(IPC0CP_SOURCES
     cpp/ipc0cp/serialize.cpp
     cpp/ipc0cp/ring_buffer.cpp
+    cpp/ipc0cp/stdio.cpp
 )
 
 set(IPC0CP_HEADERS
+    cpp/ipc0cp/ipc.hpp
     cpp/ipc0cp/serialize.hpp
     cpp/ipc0cp/ring_buffer.hpp
+    cpp/ipc0cp/stdio.hpp
 )
 
 # Create static library
@@ -122,4 +125,17 @@ if(BUILD_TESTS)
     add_executable(test_consumer cpp/tests/test_consumer.cpp)
     target_link_libraries(test_consumer PRIVATE ipc0cp_static rt)
     target_include_directories(test_consumer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
+    
+    # Cross-language integration test (Python producer -> C++ consumer)
+    find_program(PYTHON3 python3)
+    if(PYTHON3)
+        add_test(NAME CrossLanguageTest 
+            COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/cpp/tests/run_cross_language_test.sh
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_tests_properties(CrossLanguageTest PROPERTIES 
+            TIMEOUT 30
+            ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python"
+        )
+    endif()
 endif()

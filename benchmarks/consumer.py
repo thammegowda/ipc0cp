@@ -13,7 +13,8 @@ from typing import Optional
 # Add parent directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
-from ipc0cp.ring_buffer import SharedRingBufferConsumer, RingBufferException, RingBufferError
+from ipc0cp.ring_buffer import SharedRingBufferConsumer
+from ipc0cp import IPCException
 
 
 def consume_stdio() -> dict:
@@ -96,7 +97,7 @@ def consume_shm(shm_name: str) -> dict:
             # Returns None only for end-of-stream, throws exception for errors
             try:
                 payload = consumer.pop(timeout=None)
-            except RingBufferException as e:
+            except IPCException as e:
                 # Handle exceptions - these are real errors, not EOS
                 print(f"Error during pop: {e} (error_type={e.error_type})", file=sys.stderr)
                 raise

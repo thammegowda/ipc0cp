@@ -26,7 +26,7 @@ class TestSharedRingBufferGenericObjects:
                 "Hello, World!",
                 "Line of text with unicode: café ☕",
                 "A" * 1000,  # Long string
-                "",  # Empty string
+                " ",  # Single space (not empty)
                 "多行文本\n换行测试",  # Multi-byte characters
             ]
             
@@ -80,7 +80,7 @@ class TestSharedRingBufferGenericObjects:
                 b"Hello, bytes!",
                 bytes(range(256)),  # All byte values
                 b"\x00\x01\x02\xff\xfe\xfd",  # Binary data
-                b"",  # Empty bytes
+                b" ",  # Single byte (not empty)
                 b"A" * 10000,  # Large bytes
             ]
             

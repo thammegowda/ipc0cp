@@ -1,8 +1,10 @@
 #include "ring_buffer.hpp"
+#include "logger.hpp"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <endian.h>
 #include <cstring>
 #include <thread>
 #include <stdexcept>
@@ -15,8 +17,32 @@ namespace ipc0cp {
 
 namespace {
 
-// Read little-endian uint64 from memory
-uint64_t readUint64LE(const void* ptr) {
+inline uint64_t data_begin_abs() {
+    return HEADER_SIZE;
+}
+
+inline uint64_t data_end_abs(size_t total_data_bytes) {
+    return HEADER_SIZE + total_data_bytes;
+}
+
+inline uint64_t normalize_abs(uint64_t abs_pos, size_t total_data_bytes) {
+    const uint64_t begin = data_begin_abs();
+    const uint64_t end = data_end_abs(total_data_bytes);
+    if (abs_pos >= end) {
+        return begin + (abs_pos - begin) % total_data_bytes;
+    }
+    return abs_pos;
+}
+
+// Accept either an absolute position (>= HEADER_SIZE) or a data-relative position
+// (< HEADER_SIZE) and return an absolute position in the data region.
+inline uint64_t to_abs_pos(uint64_t pos_or_rel, size_t total_data_bytes) {
+    uint64_t abs_pos = (pos_or_rel < HEADER_SIZE) ? (data_begin_abs() + pos_or_rel) : pos_or_rel;
+    return normalize_abs(abs_pos, total_data_bytes);
+}
+
+// Read little-endian uint64 from memory (explicit byte-by-byte)
+uint64_t read_uint64_le(const void* ptr) {
     const uint8_t* bytes = static_cast<const uint8_t*>(ptr);
     return static_cast<uint64_t>(bytes[0]) |
            (static_cast<uint64_t>(bytes[1]) << 8) |
@@ -28,8 +54,8 @@ uint64_t readUint64LE(const void* ptr) {
            (static_cast<uint64_t>(bytes[7]) << 56);
 }
 
-// Read little-endian uint32 from memory
-uint32_t readUint32LE(const void* ptr) {
+// Read little-endian uint32 from memory (explicit byte-by-byte)
+uint32_t read_uint32_le(const void* ptr) {
     const uint8_t* bytes = static_cast<const uint8_t*>(ptr);
     return static_cast<uint32_t>(bytes[0]) |
            (static_cast<uint32_t>(bytes[1]) << 8) |
@@ -37,17 +63,26 @@ uint32_t readUint32LE(const void* ptr) {
            (static_cast<uint32_t>(bytes[3]) << 24);
 }
 
-// Write little-endian uint64 to memory
-void writeUint64LE(void* ptr, uint64_t value) {
+// Write little-endian uint64 to memory (explicit byte-by-byte)
+void write_uint64_le(void* ptr, uint64_t value) {
     uint8_t* bytes = static_cast<uint8_t*>(ptr);
-    bytes[0] = value & 0xFF;
-    bytes[1] = (value >> 8) & 0xFF;
-    bytes[2] = (value >> 16) & 0xFF;
-    bytes[3] = (value >> 24) & 0xFF;
-    bytes[4] = (value >> 32) & 0xFF;
-    bytes[5] = (value >> 40) & 0xFF;
-    bytes[6] = (value >> 48) & 0xFF;
-    bytes[7] = (value >> 56) & 0xFF;
+    bytes[0] = static_cast<uint8_t>(value);
+    bytes[1] = static_cast<uint8_t>(value >> 8);
+    bytes[2] = static_cast<uint8_t>(value >> 16);
+    bytes[3] = static_cast<uint8_t>(value >> 24);
+    bytes[4] = static_cast<uint8_t>(value >> 32);
+    bytes[5] = static_cast<uint8_t>(value >> 40);
+    bytes[6] = static_cast<uint8_t>(value >> 48);
+    bytes[7] = static_cast<uint8_t>(value >> 56);
+}
+
+// Write little-endian uint32 to memory (explicit byte-by-byte)
+void write_uint32_le(void* ptr, uint32_t value) {
+    uint8_t* bytes = static_cast<uint8_t*>(ptr);
+    bytes[0] = static_cast<uint8_t>(value);
+    bytes[1] = static_cast<uint8_t>(value >> 8);
+    bytes[2] = static_cast<uint8_t>(value >> 16);
+    bytes[3] = static_cast<uint8_t>(value >> 24);
 }
 
 } // anonymous namespace
@@ -69,33 +104,33 @@ SharedRingBufferBase::~SharedRingBufferBase() {
     close();
 }
 
-uint64_t SharedRingBufferBase::get_write_offset() const {
+uint64_t SharedRingBufferBase::get_write_pos() const {
     if (!shm_ptr_) return 0;
-    return readUint64LE(shm_ptr_);
+    return read_uint64_le(shm_ptr_);
 }
 
-uint64_t SharedRingBufferBase::get_read_offset() const {
+uint64_t SharedRingBufferBase::get_read_pos() const {
     if (!shm_ptr_) return 0;
-    return readUint64LE(static_cast<const uint8_t*>(shm_ptr_) + 8);
+    return read_uint64_le(static_cast<const uint8_t*>(shm_ptr_) + 8);
 }
 
-size_t SharedRingBufferBase::available_space(uint64_t write_offset, uint64_t read_offset) const {
-    if (write_offset >= read_offset) {
+size_t SharedRingBufferBase::available_space(uint64_t write_pos, uint64_t read_pos) const {
+    if (write_pos >= read_pos) {
         // Case 1: write is ahead of read
-        size_t space_to_end = (HEADER_SIZE + total_data_bytes_) - write_offset;
-        size_t space_from_start = read_offset - HEADER_SIZE;
+        size_t space_to_end = (HEADER_SIZE + total_data_bytes_) - write_pos;
+        size_t space_from_start = read_pos - HEADER_SIZE;
         return space_to_end + space_from_start;
     } else {
         // Case 2: write has wrapped around
-        return read_offset - write_offset;
+        return read_pos - write_pos;
     }
 }
 
-uint64_t SharedRingBufferBase::normalize_offset(uint64_t offset) const {
-    if (offset >= HEADER_SIZE + total_data_bytes_) {
-        return HEADER_SIZE + (offset - HEADER_SIZE) % total_data_bytes_;
+uint64_t SharedRingBufferBase::normalize_pos(uint64_t pos) const {
+    if (pos >= HEADER_SIZE + total_data_bytes_) {
+        return HEADER_SIZE + (pos - HEADER_SIZE) % total_data_bytes_;
     }
-    return offset;
+    return pos;
 }
 
 void SharedRingBufferBase::close() {
@@ -112,27 +147,27 @@ void SharedRingBufferBase::close() {
 void SharedRingBufferBase::unlink() {
     if (!shm_name_.empty()) {
         shm_unlink(shm_name_.c_str());
-        std::cout << "Unlinked shared memory '" << shm_name_ << "'" << std::endl;
+        IPC_LOG_INFO("Unlinked shared memory '" << shm_name_ << "'");
     }
 }
 
 SharedRingBufferBase::Stats SharedRingBufferBase::get_stats() const {
-    uint64_t write_offset = get_write_offset();
-    uint64_t read_offset = get_read_offset();
-    size_t available = available_space(write_offset, read_offset);
+    uint64_t write_pos = get_write_pos();
+    uint64_t read_pos = get_read_pos();
+    size_t available = available_space(write_pos, read_pos);
     
     return Stats{
-        .write_offset = write_offset,
-        .read_offset = read_offset,
+        .write_pos = write_pos,
+        .read_pos = read_pos,
         .available_bytes = available,
         .used_bytes = total_data_bytes_ - available,
         .total_data_bytes = total_data_bytes_,
-        .is_empty = (write_offset == read_offset)
+        .is_empty = (write_pos == read_pos)
     };
 }
 
 bool SharedRingBufferBase::is_empty() const {
-    return get_write_offset() == get_read_offset();
+    return get_write_pos() == get_read_pos();
 }
 
 // SharedRingBufferConsumer implementation
@@ -141,9 +176,11 @@ SharedRingBufferConsumer::SharedRingBufferConsumer(
     std::string shm_name,
     size_t total_data_bytes,
     bool blocking,
-    bool auto_attach
+    bool auto_attach,
+    bool auto_unlink
 )
-    : SharedRingBufferBase(std::move(shm_name), total_data_bytes, blocking)
+    : SharedRingBufferBase(std::move(shm_name), total_data_bytes, blocking),
+      auto_unlink_(auto_unlink)
 {
     if (auto_attach) {
         if (!attach()) {
@@ -188,39 +225,39 @@ bool SharedRingBufferConsumer::attach() {
     }
     
     // Read and verify total_data_bytes from header
-    uint64_t stored_total = readUint64LE(static_cast<const uint8_t*>(shm_ptr_) + 16);
+    uint64_t stored_total = read_uint64_le(static_cast<const uint8_t*>(shm_ptr_) + 16);
     if (stored_total != total_data_bytes_) {
-        std::cerr << "Warning: total_data_bytes mismatch: using stored value " << stored_total << std::endl;
+        IPC_LOG_WARNING("total_data_bytes mismatch: using stored value " << stored_total);
         total_data_bytes_ = stored_total;
         shm_size_ = HEADER_SIZE + stored_total;
     }
     
-    std::cout << "Attached to shared memory '" << shm_name_ << "'" << std::endl;
+    IPC_LOG_INFO("Attached to shared memory '" << shm_name_ << "'");
     return true;
 }
 
-void SharedRingBufferConsumer::set_read_offset(uint64_t offset) {
+void SharedRingBufferConsumer::set_read_pos(uint64_t pos) {
     if (shm_ptr_) {
-        writeUint64LE(static_cast<uint8_t*>(shm_ptr_) + 8, offset);
+        write_uint64_le(static_cast<uint8_t*>(shm_ptr_) + 8, pos);
     }
 }
 
 uint64_t SharedRingBufferConsumer::read_uint64(uint64_t pos) {
     auto bytes = read_bytes(pos, 8);
-    return readUint64LE(bytes.data());
+    return read_uint64_le(bytes.data());
 }
 
 uint32_t SharedRingBufferConsumer::read_uint32(uint64_t pos) {
     auto bytes = read_bytes(pos, 4);
-    return readUint32LE(bytes.data());
+    return read_uint32_le(bytes.data());
 }
 
 std::vector<uint8_t> SharedRingBufferConsumer::read_bytes(uint64_t pos, size_t length) {
     std::vector<uint8_t> result(length);
-    
-    // Convert ring buffer position to absolute shared memory position
-    uint64_t abs_pos = HEADER_SIZE + (pos % total_data_bytes_);
-    const uint64_t end_of_region = HEADER_SIZE + total_data_bytes_;
+
+    // Stored values are absolute positions in the mapped region.
+    uint64_t abs_pos = to_abs_pos(pos, total_data_bytes_);
+    const uint64_t end_of_region = data_end_abs(total_data_bytes_);
     
     if (abs_pos + length <= end_of_region) {
         // No wraparound
@@ -232,15 +269,15 @@ std::vector<uint8_t> SharedRingBufferConsumer::read_bytes(uint64_t pos, size_t l
         
         size_t second_part_len = length - first_part_len;
         std::memcpy(result.data() + first_part_len,
-                   static_cast<const uint8_t*>(shm_ptr_) + HEADER_SIZE,
+                   static_cast<const uint8_t*>(shm_ptr_) + data_begin_abs(),
                    second_part_len);
     }
     
     return result;
 }
 
-uint64_t SharedRingBufferConsumer::advance_pos(uint64_t pos, size_t offset) {
-    return normalize_offset(pos + offset);
+uint64_t SharedRingBufferConsumer::advance_pos(uint64_t pos, size_t delta) {
+    return normalize_pos(pos + delta);
 }
 
 std::optional<std::map<std::string, std::string>> SharedRingBufferConsumer::parse_metadata(
@@ -269,7 +306,7 @@ std::optional<std::map<std::string, std::string>> SharedRingBufferConsumer::pars
         
         return metadata_map;
     } catch (const json::exception& e) {
-        std::cerr << "JSON parse error: " << e.what() << std::endl;
+        IPC_LOG_ERROR("JSON parse error: " << e.what());
         last_error_ = RingBufferError::InvalidMetadata;
         return std::nullopt;
     } catch (...) {
@@ -289,10 +326,10 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     auto start_time = std::chrono::steady_clock::now();
     
     while (true) {
-        uint64_t write_offset = get_write_offset();
-        uint64_t read_offset = get_read_offset();
+        uint64_t write_pos = get_write_pos();
+        uint64_t read_pos = get_read_pos();
         
-        if (write_offset != read_offset) {
+        if (write_pos != read_pos) {
             break;  // Data available
         }
         
@@ -310,12 +347,12 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
     
-    // Read slot at read_offset
-    uint64_t read_offset = get_read_offset();
-    uint64_t current_pos = read_offset;
+    // Read slot at read_pos
+    uint64_t read_pos = get_read_pos();
+    uint64_t current_pos = read_pos;
     
-    // Read next_offset (8 bytes)
-    uint64_t next_offset = read_uint64(current_pos);
+    // Read next_pos (8 bytes)
+    uint64_t next_pos = read_uint64(current_pos);
     current_pos = advance_pos(current_pos, 8);
     
     // Read metadata_size (4 bytes)
@@ -335,9 +372,17 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
     // Check for end-of-stream marker (payload_size == 0)
     if (payload_size == 0) {
         eos_received_ = true;
-        std::cout << "Received end-of-stream marker" << std::endl;
-        // Update read_offset to consume the EOS slot
-        set_read_offset(next_offset);
+        IPC_LOG_INFO("Received end-of-stream marker");
+        // Update read_pos to consume the EOS slot
+        set_read_pos(next_pos);
+        
+        // Auto-cleanup: unlink shared memory when EOS received
+        if (auto_unlink_) {
+            close();
+            unlink();
+            IPC_LOG_INFO("Auto-unlinked shared memory after EOS");
+        }
+        
         return std::nullopt;
     }
     
@@ -382,8 +427,8 @@ std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
         throw RingBufferException(RingBufferError::DeserializationFailed);
     }
     
-    // Update read_offset
-    set_read_offset(next_offset);
+    // Update read_pos
+    set_read_pos(next_pos);
     
     // Create and return RingBufferObject
     RingBufferObject obj(std::move(deserialized));
@@ -449,24 +494,6 @@ SharedRingBufferProducer& SharedRingBufferProducer::operator=(SharedRingBufferPr
     return *this;
 }
 
-void SharedRingBufferProducer::write_uint64_le(uint8_t* ptr, uint64_t value) {
-    ptr[0] = value & 0xFF;
-    ptr[1] = (value >> 8) & 0xFF;
-    ptr[2] = (value >> 16) & 0xFF;
-    ptr[3] = (value >> 24) & 0xFF;
-    ptr[4] = (value >> 32) & 0xFF;
-    ptr[5] = (value >> 40) & 0xFF;
-    ptr[6] = (value >> 48) & 0xFF;
-    ptr[7] = (value >> 56) & 0xFF;
-}
-
-void SharedRingBufferProducer::write_uint32_le(uint8_t* ptr, uint32_t value) {
-    ptr[0] = value & 0xFF;
-    ptr[1] = (value >> 8) & 0xFF;
-    ptr[2] = (value >> 16) & 0xFF;
-    ptr[3] = (value >> 24) & 0xFF;
-}
-
 bool SharedRingBufferProducer::init_shm(bool create_new) {
     int flags = O_RDWR;
     if (create_new) {
@@ -476,15 +503,15 @@ bool SharedRingBufferProducer::init_shm(bool create_new) {
     // Open/create shared memory
     shm_fd_ = shm_open(shm_name_.c_str(), flags, 0666);
     if (shm_fd_ < 0) {
-        std::cerr << "Failed to open shared memory '" << shm_name_ << "': " 
-                  << strerror(errno) << std::endl;
+        IPC_LOG_ERROR("Failed to open shared memory '" << shm_name_ << "': " 
+                  << strerror(errno));
         return false;
     }
     
     if (create_new) {
         // Set size for new shared memory
         if (ftruncate(shm_fd_, shm_size_) < 0) {
-            std::cerr << "Failed to set shared memory size: " << strerror(errno) << std::endl;
+            IPC_LOG_ERROR("Failed to set shared memory size: " << strerror(errno));
             ::close(shm_fd_);
             shm_fd_ = -1;
             shm_unlink(shm_name_.c_str());
@@ -494,14 +521,14 @@ bool SharedRingBufferProducer::init_shm(bool create_new) {
         // Verify size for existing shared memory
         struct stat stat_buf;
         if (fstat(shm_fd_, &stat_buf) < 0) {
-            std::cerr << "Failed to stat shared memory: " << strerror(errno) << std::endl;
+            IPC_LOG_ERROR("Failed to stat shared memory: " << strerror(errno));
             ::close(shm_fd_);
             shm_fd_ = -1;
             return false;
         }
         
         if (static_cast<size_t>(stat_buf.st_size) != shm_size_) {
-            std::cerr << "Shared memory size mismatch" << std::endl;
+            IPC_LOG_ERROR("Shared memory size mismatch");
             ::close(shm_fd_);
             shm_fd_ = -1;
             return false;
@@ -511,7 +538,7 @@ bool SharedRingBufferProducer::init_shm(bool create_new) {
     // Map shared memory
     shm_ptr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
     if (shm_ptr_ == MAP_FAILED) {
-        std::cerr << "Failed to map shared memory: " << strerror(errno) << std::endl;
+        IPC_LOG_ERROR("Failed to map shared memory: " << strerror(errno));
         ::close(shm_fd_);
         shm_fd_ = -1;
         shm_ptr_ = nullptr;
@@ -524,122 +551,116 @@ bool SharedRingBufferProducer::init_shm(bool create_new) {
     if (create_new) {
         // Initialize header
         auto* header = static_cast<uint8_t*>(shm_ptr_);
-        write_uint64_le(header + 0, 0);  // write_offset
-        write_uint64_le(header + 8, 0);  // read_offset
+        // Positions are absolute within the mapped shared memory region.
+        // Match Python: initial positions start at the beginning of the data region.
+        write_uint64_le(header + 0, data_begin_abs());  // write_pos
+        write_uint64_le(header + 8, data_begin_abs());  // read_pos
         write_uint64_le(header + 16, total_data_bytes_);  // total_data_bytes
         
-        std::cout << "Created shared memory '" << shm_name_ << "' (" 
-                  << shm_size_ << " bytes)" << std::endl;
+        IPC_LOG_INFO("Created shared memory '" << shm_name_ << "' (" 
+                  << shm_size_ << " bytes)");
     } else {
-        std::cout << "Attached to shared memory '" << shm_name_ << "'" << std::endl;
+        IPC_LOG_INFO("Attached to shared memory '" << shm_name_ << "'");
     }
     
     return true;
 }
 
-uint64_t SharedRingBufferProducer::get_write_offset() const {
+uint64_t SharedRingBufferProducer::get_write_pos() const {
     if (!shm_ptr_) return 0;
-    auto* ptr = static_cast<const uint8_t*>(shm_ptr_);
-    uint64_t value = 0;
-    for (int i = 7; i >= 0; --i) {
-        value = (value << 8) | ptr[i];
-    }
-    return value;
+    return read_uint64_le(static_cast<const uint8_t*>(shm_ptr_));
 }
 
-uint64_t SharedRingBufferProducer::get_read_offset() const {
+uint64_t SharedRingBufferProducer::get_read_pos() const {
     if (!shm_ptr_) return 0;
-    auto* ptr = static_cast<const uint8_t*>(shm_ptr_) + 8;
-    uint64_t value = 0;
-    for (int i = 7; i >= 0; --i) {
-        value = (value << 8) | ptr[i];
-    }
-    return value;
+    return read_uint64_le(static_cast<const uint8_t*>(shm_ptr_) + 8);
 }
 
-void SharedRingBufferProducer::set_write_offset(uint64_t offset) {
+void SharedRingBufferProducer::set_write_pos(uint64_t pos) {
     if (shm_ptr_) {
-        write_uint64_le(static_cast<uint8_t*>(shm_ptr_), offset);
+        write_uint64_le(static_cast<uint8_t*>(shm_ptr_), pos);
     }
 }
 
-size_t SharedRingBufferProducer::available_space(uint64_t write_offset, uint64_t read_offset) const {
-    if (write_offset >= read_offset) {
-        return total_data_bytes_ - (write_offset - read_offset);
-    } else {
-        return read_offset - write_offset;
+size_t SharedRingBufferProducer::available_space(uint64_t write_pos, uint64_t read_pos) const {
+    // Positions are absolute in [HEADER_SIZE, HEADER_SIZE + total_data_bytes_)
+    // Compute free space exactly like the Python implementation.
+    if (write_pos >= read_pos) {
+        size_t space_to_end = data_end_abs(total_data_bytes_) - write_pos;
+        size_t space_from_start = read_pos - data_begin_abs();
+        return space_to_end + space_from_start;
     }
+    return read_pos - write_pos;
 }
 
 size_t SharedRingBufferProducer::available_space() const {
-    return available_space(get_write_offset(), get_read_offset());
+    return available_space(get_write_pos(), get_read_pos());
 }
 
 void SharedRingBufferProducer::write_bytes(size_t pos, const void* data, size_t size) {
-    auto* dest = static_cast<uint8_t*>(shm_ptr_) + HEADER_SIZE + pos;
-    std::memcpy(dest, data, size);
+    // Write at an absolute position within the mapped region, handling wraparound.
+    const uint64_t end_of_region = data_end_abs(total_data_bytes_);
+    uint64_t abs_pos = to_abs_pos(static_cast<uint64_t>(pos), total_data_bytes_);
+
+    if (abs_pos + size <= end_of_region) {
+        std::memcpy(static_cast<uint8_t*>(shm_ptr_) + abs_pos, data, size);
+        return;
+    }
+
+    // Wraparound needed
+    size_t first_part = end_of_region - abs_pos;
+    std::memcpy(static_cast<uint8_t*>(shm_ptr_) + abs_pos, data, first_part);
+    size_t second_part = size - first_part;
+    std::memcpy(static_cast<uint8_t*>(shm_ptr_) + data_begin_abs(),
+                static_cast<const uint8_t*>(data) + first_part,
+                second_part);
 }
 
 bool SharedRingBufferProducer::write_slot(
     const std::string& metadata_json,
     const std::vector<uint8_t>& payload,
-    uint64_t write_offset
+    uint64_t write_pos
 ) {
     uint32_t metadata_size = metadata_json.size();
     uint64_t payload_size = payload.size();
     // Include sentinels in slot size calculation
     uint64_t slot_size = SLOT_HEADER_SIZE + metadata_size + 1 + payload_size + 1;
-    uint64_t next_offset = (write_offset + slot_size) % total_data_bytes_;
+    uint64_t next_pos = write_pos + slot_size;
+    next_pos = normalize_abs(next_pos, total_data_bytes_);
     
     // Write slot header
     uint8_t slot_header[SLOT_HEADER_SIZE];
-    write_uint64_le(slot_header, next_offset);
+    write_uint64_le(slot_header, next_pos);
     write_uint32_le(slot_header + 8, metadata_size);
     write_uint64_le(slot_header + 12, payload_size);
     
-    // Calculate positions
-    size_t header_pos = write_offset % total_data_bytes_;
-    size_t metadata_pos = (header_pos + SLOT_HEADER_SIZE) % total_data_bytes_;
-    size_t start_sentinel_pos = (metadata_pos + metadata_size) % total_data_bytes_;
-    size_t payload_pos = (start_sentinel_pos + 1) % total_data_bytes_;
-    size_t end_sentinel_pos = (payload_pos + payload_size) % total_data_bytes_;
-    
+    auto advance_abs = [&](uint64_t pos, uint64_t delta) -> uint64_t {
+        return normalize_abs(pos + delta, total_data_bytes_);
+    };
+
+    uint64_t header_pos = write_pos;
+    uint64_t metadata_pos = advance_abs(header_pos, SLOT_HEADER_SIZE);
+    uint64_t start_sentinel_pos = advance_abs(metadata_pos, metadata_size);
+    uint64_t payload_pos = advance_abs(start_sentinel_pos, 1);
+    uint64_t end_sentinel_pos = advance_abs(payload_pos, payload_size);
+
     // Write slot header
-    if (header_pos + SLOT_HEADER_SIZE <= total_data_bytes_) {
-        write_bytes(header_pos, slot_header, SLOT_HEADER_SIZE);
-    } else {
-        // Wrap around
-        size_t first_part = total_data_bytes_ - header_pos;
-        write_bytes(header_pos, slot_header, first_part);
-        write_bytes(0, slot_header + first_part, SLOT_HEADER_SIZE - first_part);
-    }
-    
+    write_bytes(header_pos, slot_header, SLOT_HEADER_SIZE);
+
     // Write metadata
-    if (metadata_pos + metadata_size <= total_data_bytes_) {
+    if (metadata_size > 0) {
         write_bytes(metadata_pos, metadata_json.data(), metadata_size);
-    } else {
-        // Wrap around
-        size_t first_part = total_data_bytes_ - metadata_pos;
-        write_bytes(metadata_pos, metadata_json.data(), first_part);
-        write_bytes(0, metadata_json.data() + first_part, metadata_size - first_part);
     }
-    
+
     // Write start sentinel
     uint8_t sentinel = SENTINEL_BYTE;
     write_bytes(start_sentinel_pos, &sentinel, 1);
-    
+
     // Write payload
-    if (!payload.empty()) {
-        if (payload_pos + payload_size <= total_data_bytes_) {
-            write_bytes(payload_pos, payload.data(), payload_size);
-        } else {
-            // Wrap around
-            size_t first_part = total_data_bytes_ - payload_pos;
-            write_bytes(payload_pos, payload.data(), first_part);
-            write_bytes(0, payload.data() + first_part, payload_size - first_part);
-        }
+    if (payload_size > 0) {
+        write_bytes(payload_pos, payload.data(), payload_size);
     }
-    
+
     // Write end sentinel
     write_bytes(end_sentinel_pos, &sentinel, 1);
     
@@ -662,43 +683,43 @@ bool SharedRingBufferProducer::push_raw(
     int timeout_ms
 ) {
     if (!shm_ptr_) {
-        std::cerr << "Shared memory not initialized" << std::endl;
+        IPC_LOG_ERROR("Shared memory not initialized");
         return false;
     }
     
     if (metadata_json.size() > MAX_METADATA_SIZE) {
-        std::cerr << "Metadata too large: " << metadata_json.size() << " > " << MAX_METADATA_SIZE << std::endl;
+        IPC_LOG_ERROR("Metadata too large: " << metadata_json.size() << " > " << MAX_METADATA_SIZE);
         return false;
     }
     
-    uint64_t slot_size = SLOT_HEADER_SIZE + metadata_json.size() + 1 + payload.size() + 1;
+    size_t slot_size = SLOT_HEADER_SIZE + metadata_json.size() + 2 + payload.size();
     if (slot_size > MAX_SLOT_SIZE) {
-        std::cerr << "Slot too large: " << slot_size << " > " << MAX_SLOT_SIZE << std::endl;
+        IPC_LOG_ERROR("Slot too large: " << slot_size << " > " << MAX_SLOT_SIZE);
         return false;
     }
     
     // Wait for space
     auto start_time = std::chrono::steady_clock::now();
     while (true) {
-        uint64_t write_offset = get_write_offset();
-        uint64_t read_offset = get_read_offset();
-        size_t available = available_space(write_offset, read_offset);
+        uint64_t write_pos = get_write_pos();
+        uint64_t read_pos = get_read_pos();
+        size_t available = available_space(write_pos, read_pos);
         
         if (available >= slot_size) {
             // Write slot
-            if (!write_slot(metadata_json, payload, write_offset)) {
+            if (!write_slot(metadata_json, payload, write_pos)) {
                 return false;
             }
             
-            // Update write offset
-            uint64_t next_offset = (write_offset + slot_size) % total_data_bytes_;
-            set_write_offset(next_offset);
+            // Update write position
+            uint64_t next_pos = normalize_abs(write_pos + slot_size, total_data_bytes_);
+            set_write_pos(next_pos);
             return true;
         }
         
         // Check timeout
         if (timeout_ms == 0) {
-            std::cerr << "Buffer full (no wait)" << std::endl;
+            IPC_LOG_ERROR("Buffer full (no wait)");
             return false;
         }
         
@@ -706,7 +727,7 @@ bool SharedRingBufferProducer::push_raw(
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             if (elapsed_ms >= timeout_ms) {
-                std::cerr << "Timeout waiting for space" << std::endl;
+                IPC_LOG_ERROR("Timeout waiting for space");
                 return false;
             }
         }

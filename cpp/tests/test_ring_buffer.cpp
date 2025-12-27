@@ -138,9 +138,10 @@ TEST_F(RingBufferTest, EmptyBuffer) {
     SharedRingBufferProducer producer(shm_name_, buffer_size, true);
     SharedRingBufferConsumer consumer(shm_name_, buffer_size);
     
-    // Try to pop from empty buffer with short timeout
-    auto obj = consumer.pop(std::chrono::milliseconds(100));  // 100ms timeout
-    EXPECT_FALSE(obj.has_value());
+    // Try to pop from empty buffer with short timeout - should throw IPCException
+    EXPECT_THROW({
+        consumer.pop(std::chrono::milliseconds(100));  // 100ms timeout
+    }, IPCException);
 }
 
 // Test concurrent producer-consumer

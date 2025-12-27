@@ -91,8 +91,8 @@ def main():
         # Get final stats
         stats = producer.get_stats()
         print(f"\nFinal buffer stats:")
-        print(f"  Write offset: {stats['write_offset']}")
-        print(f"  Read offset: {stats['read_offset']}")
+        print(f"  Write pos: {stats['write_pos']}")
+        print(f"  Read pos: {stats['read_pos']}")
         print(f"  Available: {stats['available_bytes']} bytes")
         print(f"  Used: {stats['used_bytes']} bytes")
         print(f"  Empty: {stats['is_empty']}")

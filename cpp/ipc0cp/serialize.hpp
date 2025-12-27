@@ -246,4 +246,15 @@ public:
     static std::string format_size(size_t width, size_t height);
 };
 
+/**
+ * @brief Global deserialize function
+ * @param metadata_json JSON metadata string
+ * @param payload Binary payload
+ * @return Unique pointer to deserialized object
+ */
+std::unique_ptr<SerializableObject> deserialize(
+    const std::string& metadata_json,
+    const std::vector<uint8_t>& payload
+);
+
 } // namespace ipc0cp

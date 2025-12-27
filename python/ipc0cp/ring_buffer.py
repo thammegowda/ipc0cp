@@ -1,8 +1,9 @@
-"""
+"""ipc0cp shared-memory ring buffer.
+
 Lock-free ring buffer using POSIX shared memory for single-producer/single-consumer IPC.
 
 This module implements a variable-size slot ring buffer using a hybrid linked-list approach
-with offset tracking in the header for efficient lock-free operations.
+with position tracking in the header for efficient lock-free operations.
 
 Supports generic objects with JSON metadata including:
 - NumPy arrays
@@ -20,54 +21,15 @@ from abc import ABC, abstractmethod
 from multiprocessing import shared_memory
 from typing import Any, Optional
 
-from .serialize import SERIALIZERS, MAX_METADATA_SIZE, get_serializer
+from .ipc import IPCError, IPCException
+from .serialize import MAX_METADATA_SIZE, serialize_object, deserialize_object
 
 logger = logging.getLogger(__name__)
 
 
-# Error types enum
-class RingBufferError:
-    """Error types for ring buffer operations."""
-    NONE = "none"
-    NOT_INITIALIZED = "not_initialized"
-    SHM_NOT_FOUND = "shm_not_found"
-    SIZE_MISMATCH = "size_mismatch"
-    INVALID_METADATA = "invalid_metadata"
-    INVALID_SLOT = "invalid_slot"
-    TIMEOUT = "timeout"
-    BUFFER_EMPTY = "buffer_empty"
-    DESERIALIZATION_FAILED = "deserialization_failed"
-    CORRUPT_PAYLOAD = "corrupt_payload"
-
-
-class RingBufferException(Exception):
-    """Exception for ring buffer errors."""
-    def __init__(self, error_type: str, message: str = None):
-        self.error_type = error_type
-        if message is None:
-            message = self._get_default_message(error_type)
-        super().__init__(message)
-    
-    @staticmethod
-    def _get_default_message(error_type: str) -> str:
-        messages = {
-            RingBufferError.NONE: "No error",
-            RingBufferError.NOT_INITIALIZED: "Shared memory not initialized",
-            RingBufferError.SHM_NOT_FOUND: "Shared memory segment not found",
-            RingBufferError.SIZE_MISMATCH: "Shared memory size mismatch",
-            RingBufferError.INVALID_METADATA: "Invalid metadata",
-            RingBufferError.INVALID_SLOT: "Invalid slot data",
-            RingBufferError.TIMEOUT: "Operation timed out",
-            RingBufferError.BUFFER_EMPTY: "Buffer is empty",
-            RingBufferError.DESERIALIZATION_FAILED: "Deserialization failed",
-            RingBufferError.CORRUPT_PAYLOAD: "Corrupt payload: sentinel bytes mismatch",
-        }
-        return messages.get(error_type, "Unknown error")
-
-
 # Constants
-HEADER_SIZE = 24  # 3 * uint64: write_offset, read_offset, total_data_bytes
-SLOT_HEADER_SIZE = 20  # next_offset(8) + metadata_size(4) + payload_size(8)
+HEADER_SIZE = 24  # 3 * uint64: write_pos, read_pos, total_data_bytes
+SLOT_HEADER_SIZE = 20  # next_pos(8) + metadata_size(4) + payload_size(8)
 SENTINEL_BYTE = 0x00  # Null byte for data integrity checking (before and after payload)
 MAX_SLOT_SIZE = 10 * 1024 * 1024  # 10 MB
 DEFAULT_TOTAL_DATA_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
@@ -78,17 +40,17 @@ class SharedRingBufferBase(ABC):
     Lock-free ring buffer for variable-size generic objects using shared memory.
     
     Uses a hybrid linked-list approach where:
-    - Header contains write_offset and read_offset for O(1) space checking
-    - Each slot contains next_offset pointer for sequential traversal
-    - Single producer writes at write_offset
-    - Single consumer reads at read_offset
+    - Header contains write_pos and read_pos (absolute positions) for O(1) space checking
+    - Each slot contains next_pos pointer for sequential traversal
+    - Single producer writes at write_pos
+    - Single consumer reads at read_pos
     
     Memory Layout:
-        [Header: write_offset | read_offset | total_data_bytes]
+        [Header: write_pos | read_pos | total_data_bytes]
         [Data Region: Slot0 → Slot1 → Slot2 → ...]
         
     Each Slot:
-        next_offset (uint64, 8 bytes)
+        next_pos (uint64, 8 bytes)
         metadata_size (uint32, 4 bytes)
         payload_size (uint64, 8 bytes)
         metadata_json (bytes, max 1024)
@@ -135,58 +97,58 @@ class SharedRingBufferBase(ABC):
         # Total shared memory size
         self.shm_size = HEADER_SIZE + total_data_bytes
     
-    def _get_write_offset(self) -> int:
-        """Read write_offset from header."""
-        return struct.unpack_from('Q', self.shm.buf, 0)[0]
+    def _get_write_pos(self) -> int:
+        """Read write_pos from header."""
+        return struct.unpack_from('<Q', self.shm.buf, 0)[0]
     
-    def _set_write_offset(self, offset: int):
-        """Write write_offset to header."""
-        struct.pack_into('Q', self.shm.buf, 0, offset)
+    def _set_write_pos(self, pos: int):
+        """Write write_pos to header."""
+        struct.pack_into('<Q', self.shm.buf, 0, pos)
     
-    def _get_read_offset(self) -> int:
-        """Read read_offset from header."""
-        return struct.unpack_from('Q', self.shm.buf, 8)[0]
+    def _get_read_pos(self) -> int:
+        """Read read_pos from header."""
+        return struct.unpack_from('<Q', self.shm.buf, 8)[0]
     
-    def _set_read_offset(self, offset: int):
-        """Write read_offset to header."""
-        struct.pack_into('Q', self.shm.buf, 8, offset)
+    def _set_read_pos(self, pos: int):
+        """Write read_pos to header."""
+        struct.pack_into('<Q', self.shm.buf, 8, pos)
     
-    def _available_space(self, write_offset: int, read_offset: int) -> int:
+    def _available_space(self, write_pos: int, read_pos: int) -> int:
         """
         Calculate available space in the circular buffer.
         
         Args:
-            write_offset: Current write position
-            read_offset: Current read position
+            write_pos: Current write position
+            read_pos: Current read position
             
         Returns:
             Number of bytes available for writing
         """
-        if write_offset >= read_offset:
+        if write_pos >= read_pos:
             # Case 1: write is ahead of read
             # Available: from write to end, plus from start to read
-            space_to_end = (HEADER_SIZE + self.total_data_bytes) - write_offset
-            space_from_start = read_offset - HEADER_SIZE
+            space_to_end = (HEADER_SIZE + self.total_data_bytes) - write_pos
+            space_from_start = read_pos - HEADER_SIZE
             return space_to_end + space_from_start
         else:
             # Case 2: write has wrapped around
             # Available: from write to read
-            return read_offset - write_offset
+            return read_pos - write_pos
     
-    def _normalize_offset(self, offset: int) -> int:
+    def _normalize_pos(self, pos: int) -> int:
         """
-        Normalize offset to wrap around the circular buffer.
+        Normalize an absolute position to wrap around the circular buffer.
         
         Args:
-            offset: Raw offset value
+            pos: Raw position value
             
         Returns:
-            Normalized offset within [HEADER_SIZE, HEADER_SIZE + total_data_bytes)
+            Normalized position within [HEADER_SIZE, HEADER_SIZE + total_data_bytes)
         """
-        if offset >= HEADER_SIZE + self.total_data_bytes:
+        if pos >= HEADER_SIZE + self.total_data_bytes:
             # Wrap to beginning of data region
-            return HEADER_SIZE + (offset - HEADER_SIZE) % self.total_data_bytes
-        return offset
+            return HEADER_SIZE + (pos - HEADER_SIZE) % self.total_data_bytes
+        return pos
     
     def close(self):
         """Close the shared memory segment."""
@@ -214,21 +176,21 @@ class SharedRingBufferBase(ABC):
     
     def is_empty(self) -> bool:
         """Check if buffer is empty."""
-        return self._get_write_offset() == self._get_read_offset()
+        return self._get_write_pos() == self._get_read_pos()
     
     def get_stats(self) -> dict:
         """Get buffer statistics."""
-        write_offset = self._get_write_offset()
-        read_offset = self._get_read_offset()
-        available = self._available_space(write_offset, read_offset)
+        write_pos = self._get_write_pos()
+        read_pos = self._get_read_pos()
+        available = self._available_space(write_pos, read_pos)
         
         return {
-            'write_offset': write_offset,
-            'read_offset': read_offset,
+            'write_pos': write_pos,
+            'read_pos': read_pos,
             'available_bytes': available,
             'used_bytes': self.total_data_bytes - available,
             'total_data_bytes': self.total_data_bytes,
-            'is_empty': write_offset == read_offset,
+            'is_empty': write_pos == read_pos,
         }
 
 
@@ -260,9 +222,9 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
         self._create()
     
-    def _set_write_offset(self, offset: int):
-        """Write write_offset to header."""
-        struct.pack_into('Q', self.shm.buf, 0, offset)
+    def _set_write_pos(self, pos: int):
+        """Write write_pos to header."""
+        struct.pack_into('<Q', self.shm.buf, 0, pos)
     
     def _write_with_wrap(self, start_pos: int, data: bytes) -> int:
         """
@@ -292,12 +254,12 @@ class SharedRingBufferProducer(SharedRingBufferBase):
     
     def _write_uint64(self, pos: int, value: int) -> int:
         """Write a uint64 value handling wraparound."""
-        data = struct.pack('Q', value)
+        data = struct.pack('<Q', value)
         return self._write_with_wrap(pos, data)
     
     def _write_uint32(self, pos: int, value: int) -> int:
         """Write a uint32 value handling wraparound."""
-        data = struct.pack('I', value)
+        data = struct.pack('<I', value)
         return self._write_with_wrap(pos, data)
     
     def _create(self):
@@ -319,15 +281,15 @@ class SharedRingBufferProducer(SharedRingBufferBase):
             )
             
             # Initialize header
-            # write_offset = HEADER_SIZE (start of data region)
-            # read_offset = HEADER_SIZE (empty buffer)
+            # write_pos = HEADER_SIZE (start of data region)
+            # read_pos = HEADER_SIZE (empty buffer)
             # total_data_bytes = configured value
             struct.pack_into(
-                'QQQ',
+                '<QQQ',
                 self.shm.buf,
                 0,
-                HEADER_SIZE,  # write_offset
-                HEADER_SIZE,  # read_offset
+                HEADER_SIZE,  # write_pos
+                HEADER_SIZE,  # read_pos
                 self.total_data_bytes
             )
             
@@ -367,9 +329,9 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         # Wait for space if blocking
         start_time = time.time()
         while True:
-            write_offset = self._get_write_offset()
-            read_offset = self._get_read_offset()
-            available = self._available_space(write_offset, read_offset)
+            write_pos = self._get_write_pos()
+            read_pos = self._get_read_pos()
+            available = self._available_space(write_pos, read_pos)
             
             if available >= slot_size:
                 break
@@ -383,11 +345,11 @@ class SharedRingBufferProducer(SharedRingBufferBase):
             time.sleep(0.0005)
         
         # Write slot
-        next_offset = write_offset + slot_size
-        next_offset = self._normalize_offset(next_offset)
+        next_pos = write_pos + slot_size
+        next_pos = self._normalize_pos(next_pos)
         
-        current_pos = write_offset
-        current_pos = self._write_uint64(current_pos, next_offset)
+        current_pos = write_pos
+        current_pos = self._write_uint64(current_pos, next_pos)
         current_pos = self._write_uint32(current_pos, metadata_size)
         current_pos = self._write_uint64(current_pos, payload_size)
         current_pos = self._write_with_wrap(current_pos, metadata_bytes)
@@ -395,7 +357,7 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         current_pos = self._write_with_wrap(current_pos, payload)
         current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
         
-        self._set_write_offset(next_offset)
+        self._set_write_pos(next_pos)
         return True
     
     def available_space(self) -> int:
@@ -405,9 +367,9 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         Returns:
             Available space in bytes
         """
-        write_offset = self._get_write_offset()
-        read_offset = self._get_read_offset()
-        return self._available_space(write_offset, read_offset)
+        write_pos = self._get_write_pos()
+        read_pos = self._get_read_pos()
+        return self._available_space(write_pos, read_pos)
     
     def is_initialized(self) -> bool:
         """
@@ -444,8 +406,7 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         """
         # Serialize object
         try:
-            serializer = get_serializer(obj)
-            metadata_dict, payload = serializer.serialize(obj)
+            metadata_json, payload = serialize_object(obj)
         except Exception as e:
             raise ValueError(f"Failed to serialize object: {e}")
         
@@ -457,12 +418,6 @@ class SharedRingBufferProducer(SharedRingBufferBase):
                 f"{self.max_slot_size} bytes, skipping"
             )
             return False
-        
-        # Convert metadata to JSON
-        try:
-            metadata_json = json.dumps(metadata_dict)
-        except Exception as e:
-            raise ValueError(f"Failed to encode metadata as JSON: {e}")
         
         # Delegate to push_raw
         return self.push_raw(metadata_json, payload, timeout)
@@ -503,6 +458,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         blocking: bool = True,
         max_slot_size: int = MAX_SLOT_SIZE,
         auto_attach: bool = True,
+        auto_unlink: bool = True,
     ):
         """
         Initialize the consumer and optionally attach to existing shared memory.
@@ -513,25 +469,27 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             blocking: Whether to block when buffer is empty
             max_slot_size: Maximum allowed size per slot (default 10MB)
             auto_attach: If True, automatically attach to shared memory in constructor
+            auto_unlink: If True, automatically unlink (delete) shared memory when EOS is received
         """
         super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
         self.eos_received = False  # Track if end-of-stream was received
+        self.auto_unlink = auto_unlink
         if auto_attach:
             self._attach()
     
-    def _set_read_offset(self, offset: int):
-        """Write read_offset to header."""
-        struct.pack_into('Q', self.shm.buf, 8, offset)
+    def _set_read_pos(self, pos: int):
+        """Write read_pos to header."""
+        struct.pack_into('<Q', self.shm.buf, 8, pos)
     
     def _read_uint64(self, pos: int) -> int:
         """Read a uint64 value handling wraparound."""
         data = self._read_bytes(pos, 8)
-        return struct.unpack('Q', data)[0]
+        return struct.unpack('<Q', data)[0]
     
     def _read_uint32(self, pos: int) -> int:
         """Read a uint32 value handling wraparound."""
         data = self._read_bytes(pos, 4)
-        return struct.unpack('I', data)[0]
+        return struct.unpack('<I', data)[0]
     
     def _read_bytes(self, pos: int, length: int) -> bytes:
         """Read bytes from buffer handling wraparound."""
@@ -547,10 +505,10 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             second_part = bytes(self.shm.buf[HEADER_SIZE:HEADER_SIZE + second_part_len])
             return first_part + second_part
     
-    def _advance_pos(self, pos: int, offset: int) -> int:
-        """Advance position by offset, handling wraparound."""
-        new_pos = pos + offset
-        return self._normalize_offset(new_pos)
+    def _advance_pos(self, pos: int, delta: int) -> int:
+        """Advance position by delta bytes, handling wraparound."""
+        new_pos = pos + delta
+        return self._normalize_pos(new_pos)
     
     def _attach(self):
         """Attach to existing shared memory segment."""
@@ -565,7 +523,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
                 )
             
             # Read total_data_bytes from header
-            _, _, stored_total = struct.unpack_from('QQQ', self.shm.buf, 0)
+            _, _, stored_total = struct.unpack_from('<QQQ', self.shm.buf, 0)
             if stored_total != self.total_data_bytes:
                 logger.warning(
                     f"total_data_bytes mismatch: using stored value {stored_total}"
@@ -593,34 +551,34 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             Deserialized object, or None if end-of-stream marker received
             
         Raises:
-            RingBufferException: With error_type indicating the specific error
+            IPCException: With error_type indicating the specific error
             ValueError: If metadata is invalid
         """
         if self.shm is None:
-            raise RingBufferException(RingBufferError.NOT_INITIALIZED)
+            raise IPCException(IPCError.NOT_INITIALIZED)
         
         # Wait for data if blocking
         start_time = time.time()
         while True:
-            write_offset = self._get_write_offset()
-            read_offset = self._get_read_offset()
+            write_pos = self._get_write_pos()
+            read_pos = self._get_read_pos()
             
-            if write_offset != read_offset:
+            if write_pos != read_pos:
                 break
             
             if not self.blocking:
-                raise RingBufferException(RingBufferError.BUFFER_EMPTY)
+                raise IPCException(IPCError.BUFFER_EMPTY)
             
             if timeout is not None and (time.time() - start_time) >= timeout:
-                raise RingBufferException(RingBufferError.TIMEOUT, f"Timeout after {timeout} seconds")
+                raise IPCException(IPCError.TIMEOUT, f"Timeout after {timeout} seconds")
             
             time.sleep(0.0005)  # 500 microseconds
         
-        # Read slot at read_offset
-        current_pos = read_offset
+        # Read slot at read_pos
+        current_pos = read_pos
         
-        # Read next_offset (8 bytes)
-        next_offset = self._read_uint64(current_pos)
+        # Read next_pos (8 bytes)
+        next_pos = self._read_uint64(current_pos)
         current_pos = self._advance_pos(current_pos, 8)
         
         # Read metadata_size (4 bytes)
@@ -639,8 +597,15 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         if payload_size == 0:
             self.eos_received = True
             logger.info("Received end-of-stream marker")
-            # Update read_offset to consume the EOS slot
-            self._set_read_offset(next_offset)
+            # Update read_pos to consume the EOS slot
+            self._set_read_pos(next_pos)
+            
+            # Auto-cleanup: unlink shared memory when EOS received
+            if self.auto_unlink:
+                self.close()
+                self.unlink()
+                logger.info("Auto-unlinked shared memory after EOS")
+            
             return None
         
         # Read metadata JSON
@@ -659,7 +624,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         if len(start_sentinel) != 1 or start_sentinel[0] != SENTINEL_BYTE:
             error_msg = f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})"
             self.last_error = error_msg
-            raise RingBufferException(RingBufferError.CORRUPT_PAYLOAD, error_msg)
+            raise IPCException(IPCError.CORRUPT_PAYLOAD, error_msg)
         current_pos = self._advance_pos(current_pos, 1)
         
         # Read payload
@@ -671,24 +636,20 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         if len(end_sentinel) != 1 or end_sentinel[0] != SENTINEL_BYTE:
             error_msg = f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})"
             self.last_error = error_msg
-            raise RingBufferException(RingBufferError.CORRUPT_PAYLOAD, error_msg)
+            raise IPCException(IPCError.CORRUPT_PAYLOAD, error_msg)
         
-        # Get object type and deserialize
-        obj_type = metadata_dict.get('type')
-        if obj_type not in SERIALIZERS:
-            raise ValueError(f"Unsupported object type: {obj_type}")
-        
-        serializer = SERIALIZERS[obj_type]
-        
+        # Deserialize using metadata_str and payload
         try:
-            obj = serializer.deserialize(metadata_dict, payload)
+            # Combine metadata and payload for deserialize_object
+            combined = metadata_str.encode('utf-8') + payload
+            obj = deserialize_object(combined)
         except Exception as e:
             error_msg = f"Failed to deserialize: {e}"
             self.last_error = error_msg
-            raise RingBufferException(RingBufferError.DESERIALIZATION_FAILED, error_msg) from e
+            raise IPCException(IPCError.DESERIALIZATION_FAILED, error_msg) from e
         
-        # Update read_offset to next_offset
-        self._set_read_offset(next_offset)
+        # Update read_pos to next_pos
+        self._set_read_pos(next_pos)
         
         return obj
 

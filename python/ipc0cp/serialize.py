@@ -1,227 +1,472 @@
 """
-Serialization classes for SharedRingBuffer.
+Serialization module for inter-process communication.
 
-Provides serializers for different object types:
-- NumPy arrays
-- PIL Images
-- Text strings
-- JSON objects
-- Raw bytes
+Provides serializable object classes matching C++ hierarchy:
+- SerializableObject (base class)
+  - BytesData (raw bytes)
+    - TextData (text string)
+      - JsonData (JSON object)
+    - ImageData (PIL Image)
+    - NumpyArray (NumPy array)
 """
 
 import json
+from abc import ABC, abstractmethod
+from enum import Enum
 from io import BytesIO
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple, Optional, Union
 
-import numpy as np
-from PIL import Image
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    np = None
+
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    Image = None
 
 
 # Constants
-MAX_METADATA_SIZE = 1024  # Maximum JSON metadata size in bytes
+MAX_METADATA_SIZE = 1024
 
 
-class ObjectSerializer:
-    """Base class for object serializers."""
+class ObjectType(Enum):
+    """Object types supported by serialization"""
+    NUMPY_ARRAY = "ndarray"
+    IMAGE = "image"
+    TEXT = "text"
+    JSON = "json"
+    BYTES = "bytes"
+    UNKNOWN = "unknown"
+
+
+class SerializableObject(ABC):
+    """
+    Base class for serializable objects with polymorphic serialization.
+    """
     
-    @staticmethod
-    def serialize(obj: Any) -> Tuple[Dict[str, Any], bytes]:
+    @abstractmethod
+    def get_type(self) -> ObjectType:
+        """Get the object type"""
+        pass
+    
+    @abstractmethod
+    def serialize(self) -> Tuple[str, bytes]:
         """
-        Serialize an object to metadata and payload bytes.
+        Serialize this object to metadata JSON and payload.
         
-        Args:
-            obj: Object to serialize
-            
         Returns:
-            Tuple of (metadata_dict, payload_bytes)
+            Tuple of (metadata_json, payload_bytes)
         """
-        raise NotImplementedError
-    
-    @staticmethod
-    def deserialize(metadata: Dict[str, Any], payload: bytes) -> Any:
-        """
-        Deserialize an object from metadata and payload bytes.
-        
-        Args:
-            metadata: Metadata dictionary
-            payload: Payload bytes
-            
-        Returns:
-            Deserialized object
-        """
-        raise NotImplementedError
+        pass
 
 
-class NumpySerializer(ObjectSerializer):
-    """Serializer for NumPy arrays."""
+class BytesData(SerializableObject):
+    """
+    Raw bytes - base class for all data types.
+    All serializable objects are fundamentally bytes with interpretation.
+    """
     
-    @staticmethod
-    def serialize(obj: np.ndarray) -> Tuple[Dict[str, Any], bytes]:
-        """Serialize NumPy array."""
-        if not isinstance(obj, np.ndarray):
-            raise ValueError("Object must be a NumPy array")
-        
-        # Ensure contiguous array
-        if not obj.flags['C_CONTIGUOUS']:
-            obj = np.ascontiguousarray(obj)
-        
+    def __init__(self, data: bytes = b''):
+        self.bytes = data if isinstance(data, bytes) else bytes(data)
+    
+    def get_type(self) -> ObjectType:
+        return ObjectType.BYTES
+    
+    def serialize(self) -> Tuple[str, bytes]:
+        """Serialize bytes object"""
         metadata = {
-            'type': 'ndarray',
-            'shape': list(obj.shape),
-            'dtype': obj.dtype.str,
+            "type": self.get_type().value,
+            "size": len(self.bytes)
         }
-        
-        payload = obj.tobytes()
-        
-        return metadata, payload
+        return json.dumps(metadata), self.bytes
     
     @staticmethod
-    def deserialize(metadata: Dict[str, Any], payload: bytes) -> np.ndarray:
-        """Deserialize NumPy array."""
-        shape = tuple(metadata['shape'])
-        dtype = np.dtype(metadata['dtype'])
-        
-        array = np.frombuffer(payload, dtype=dtype).reshape(shape)
-        # Make a copy since the buffer will be overwritten
-        return array.copy()
+    def deserialize(metadata: Dict[str, str], payload: bytes) -> 'BytesData':
+        """Deserialize from metadata and payload"""
+        return BytesData(payload)
 
 
-class ImageSerializer(ObjectSerializer):
-    """Serializer for PIL Images."""
+class TextData(BytesData):
+    """
+    Text string - bytes with text encoding.
+    """
     
-    @staticmethod
-    def serialize(obj: Image.Image) -> Tuple[Dict[str, Any], bytes]:
-        """Serialize PIL Image."""
-        if not isinstance(obj, Image.Image):
-            raise ValueError("Object must be a PIL Image")
-        
-        # Convert to bytes using PNG format (lossless)
-        buffer = BytesIO()
-        obj.save(buffer, format='PNG')
-        payload = buffer.getvalue()
-        
+    def __init__(self, text: str = '', encoding: str = 'utf-8'):
+        self.text = text
+        self.encoding = encoding
+        super().__init__(text.encode(encoding))
+    
+    def get_type(self) -> ObjectType:
+        return ObjectType.TEXT
+    
+    def serialize(self) -> Tuple[str, bytes]:
+        """Serialize text object"""
         metadata = {
-            'type': 'image',
-            'mode': obj.mode,
-            'size': obj.size,  # (width, height)
+            "type": self.get_type().value,
+            "encoding": self.encoding,
+            "length": len(self.text)
         }
-        
-        return metadata, payload
+        return json.dumps(metadata), self.bytes
     
     @staticmethod
-    def deserialize(metadata: Dict[str, Any], payload: bytes) -> Image.Image:
-        """Deserialize PIL Image."""
-        buffer = BytesIO(payload)
-        return Image.open(buffer)
-
-
-class TextSerializer(ObjectSerializer):
-    """Serializer for text strings."""
-    
-    @staticmethod
-    def serialize(obj: str) -> Tuple[Dict[str, Any], bytes]:
-        """Serialize text string."""
-        if not isinstance(obj, str):
-            raise ValueError("Object must be a string")
-        
-        payload = obj.encode('utf-8')
-        
-        metadata = {
-            'type': 'text',
-            'encoding': 'utf-8',
-            'length': len(obj),
-        }
-        
-        return metadata, payload
-    
-    @staticmethod
-    def deserialize(metadata: Dict[str, Any], payload: bytes) -> str:
-        """Deserialize text string."""
+    def deserialize(metadata: Dict[str, str], payload: bytes) -> 'TextData':
+        """Deserialize from metadata and payload"""
         encoding = metadata.get('encoding', 'utf-8')
-        return payload.decode(encoding)
+        text = payload.decode(encoding)
+        return TextData(text, encoding)
 
 
-class JsonSerializer(ObjectSerializer):
-    """Serializer for JSON objects."""
+class JsonData(TextData):
+    """
+    JSON data - text with JSON structure.
+    Extends TextData, provides JSON parsing capability.
+    """
     
-    @staticmethod
-    def serialize(obj: Any) -> Tuple[Dict[str, Any], bytes]:
-        """Serialize JSON-serializable object."""
-        try:
-            json_str = json.dumps(obj)
-            payload = json_str.encode('utf-8')
-        except (TypeError, ValueError) as e:
-            raise ValueError(f"Object is not JSON-serializable: {e}")
+    def __init__(self, obj: Any):
+        """
+        Initialize from a Python object (dict, list, etc.)
         
+        Args:
+            obj: Python object to serialize as JSON
+        """
+        self.obj = obj
+        json_str = json.dumps(obj)
+        super().__init__(json_str, encoding='utf-8')
+    
+    def get_type(self) -> ObjectType:
+        return ObjectType.JSON
+    
+    def serialize(self) -> Tuple[str, bytes]:
+        """Serialize JSON object"""
         metadata = {
-            'type': 'json',
-            'encoding': 'utf-8',
+            "type": self.get_type().value,
+            "encoding": self.encoding
         }
-        
-        return metadata, payload
+        return json.dumps(metadata), self.bytes
+    
+    def json(self) -> Any:
+        """Parse and return JSON object"""
+        return json.loads(self.text)
     
     @staticmethod
-    def deserialize(metadata: Dict[str, Any], payload: bytes) -> Any:
-        """Deserialize JSON object."""
+    def deserialize(metadata: Dict[str, str], payload: bytes) -> 'JsonData':
+        """Deserialize from metadata and payload"""
         encoding = metadata.get('encoding', 'utf-8')
         json_str = payload.decode(encoding)
-        return json.loads(json_str)
+        obj = json.loads(json_str)
+        return JsonData(obj)
 
 
-class BytesSerializer(ObjectSerializer):
-    """Serializer for raw bytes."""
+class ImageData(BytesData):
+    """
+    Image representation (PNG-encoded).
+    bytes contains PNG-encoded image data.
+    """
     
-    @staticmethod
-    def serialize(obj: bytes) -> Tuple[Dict[str, Any], bytes]:
-        """Serialize raw bytes."""
-        if not isinstance(obj, bytes):
-            raise ValueError("Object must be bytes")
+    def __init__(self, image: Optional['Image.Image'] = None):
+        """
+        Initialize from PIL Image.
         
+        Args:
+            image: PIL Image object
+        """
+        if not HAS_PIL:
+            raise ImportError("PIL is required for ImageData")
+        
+        self.mode = ''
+        self.width = 0
+        self.height = 0
+        
+        if image is not None:
+            self.mode = image.mode
+            self.width, self.height = image.size
+            
+            # Encode as PNG
+            buffer = BytesIO()
+            image.save(buffer, format='PNG')
+            super().__init__(buffer.getvalue())
+        else:
+            super().__init__(b'')
+    
+    def get_type(self) -> ObjectType:
+        return ObjectType.IMAGE
+    
+    def serialize(self) -> Tuple[str, bytes]:
+        """Serialize image object"""
         metadata = {
-            'type': 'bytes',
-            'size': len(obj),
+            "type": self.get_type().value,
+            "mode": self.mode,
+            "size": json.dumps([self.width, self.height])
         }
-        
-        return metadata, obj
+        return json.dumps(metadata), self.bytes
+    
+    def to_image(self) -> 'Image.Image':
+        """Convert back to PIL Image"""
+        if not HAS_PIL:
+            raise ImportError("PIL is required for ImageData")
+        return Image.open(BytesIO(self.bytes))
     
     @staticmethod
-    def deserialize(metadata: Dict[str, Any], payload: bytes) -> bytes:
-        """Deserialize raw bytes."""
-        return payload
+    def deserialize(metadata: Dict[str, str], payload: bytes) -> 'ImageData':
+        """Deserialize from metadata and payload"""
+        if not HAS_PIL:
+            raise ImportError("PIL is required for ImageData")
+        
+        img_obj = ImageData()
+        img_obj.bytes = payload
+        img_obj.mode = metadata.get('mode', 'RGB')
+        
+        # Parse size
+        size_str = metadata.get('size', '[0,0]')
+        size_list = json.loads(size_str)
+        img_obj.width, img_obj.height = size_list[0], size_list[1]
+        
+        return img_obj
 
 
-# Registry of serializers
+class NumpyArray(BytesData):
+    """
+    NumPy array representation.
+    bytes contains raw array data.
+    """
+    
+    def __init__(self, array: Optional['np.ndarray'] = None):
+        """
+        Initialize from NumPy array.
+        
+        Args:
+            array: NumPy array object
+        """
+        if not HAS_NUMPY:
+            raise ImportError("NumPy is required for NumpyArray")
+        
+        self.shape: List[int] = []
+        self.dtype = ''
+        self.array = None
+        
+        if array is not None:
+            self.array = array
+            self.shape = list(array.shape)
+            self.dtype = array.dtype.str
+            super().__init__(array.tobytes())
+        else:
+            super().__init__(b'')
+    
+    def get_type(self) -> ObjectType:
+        return ObjectType.NUMPY_ARRAY
+    
+    def serialize(self) -> Tuple[str, bytes]:
+        """Serialize NumPy array"""
+        metadata = {
+            "type": self.get_type().value,
+            "shape": json.dumps(self.shape),
+            "dtype": self.dtype
+        }
+        return json.dumps(metadata), self.bytes
+    
+    def to_array(self) -> 'np.ndarray':
+        """Convert back to NumPy array"""
+        if not HAS_NUMPY:
+            raise ImportError("NumPy is required for NumpyArray")
+        if self.array is not None:
+            return self.array
+        return np.frombuffer(self.bytes, dtype=self.dtype).reshape(self.shape)
+    
+    def element_count(self) -> int:
+        """Get total number of elements"""
+        count = 1
+        for dim in self.shape:
+            count *= dim
+        return count
+    
+    def element_size(self) -> int:
+        """Get element size in bytes"""
+        if self.element_count() == 0:
+            return 0
+        return len(self.bytes) // self.element_count()
+    
+    @staticmethod
+    def deserialize(metadata: Dict[str, str], payload: bytes) -> 'NumpyArray':
+        """Deserialize from metadata and payload"""
+        if not HAS_NUMPY:
+            raise ImportError("NumPy is required for NumpyArray")
+        
+        np_obj = NumpyArray()
+        np_obj.bytes = payload
+        np_obj.dtype = metadata.get('dtype', '<f8')
+        
+        # Parse shape
+        shape_str = metadata.get('shape', '[]')
+        np_obj.shape = json.loads(shape_str)
+        
+        return np_obj
+
+
+# Global deserializer function
+def deserialize(metadata_json: str, payload: bytes) -> SerializableObject:
+    """
+    Deserialize from metadata JSON and payload.
+    
+    Args:
+        metadata_json: JSON metadata string
+        payload: Binary payload
+        
+    Returns:
+        Deserialized SerializableObject
+        
+    Raises:
+        ValueError: If object type is unsupported
+    """
+    # Parse metadata
+    if isinstance(metadata_json, bytes):
+        metadata_json = metadata_json.decode('utf-8')
+    
+    metadata = json.loads(metadata_json)
+    obj_type = metadata.get('type', 'unknown')
+    
+    # Dispatch to appropriate deserializer
+    if obj_type == ObjectType.NUMPY_ARRAY.value or obj_type == 'ndarray':
+        return NumpyArray.deserialize(metadata, payload)
+    elif obj_type == ObjectType.IMAGE.value or obj_type == 'image':
+        return ImageData.deserialize(metadata, payload)
+    elif obj_type == ObjectType.TEXT.value or obj_type == 'text':
+        return TextData.deserialize(metadata, payload)
+    elif obj_type == ObjectType.JSON.value or obj_type == 'json':
+        return JsonData.deserialize(metadata, payload)
+    elif obj_type == ObjectType.BYTES.value or obj_type == 'bytes':
+        return BytesData.deserialize(metadata, payload)
+    else:
+        raise ValueError(f"Unsupported object type: {obj_type}")
+
+
+# Helper functions for high-level API
+def serialize_object(obj: Any) -> Tuple[str, bytes]:
+    """
+    Serialize a Python object to metadata JSON and payload.
+    
+    Args:
+        obj: Python object (numpy array, PIL Image, str, dict, list, bytes, etc.)
+        
+    Returns:
+        Tuple of (metadata_json, payload_bytes)
+    """
+    if HAS_NUMPY and isinstance(obj, np.ndarray):
+        np_obj = NumpyArray(obj)
+        return np_obj.serialize()
+    elif HAS_PIL and isinstance(obj, Image.Image):
+        img_obj = ImageData(obj)
+        return img_obj.serialize()
+    elif isinstance(obj, str):
+        text_obj = TextData(obj)
+        return text_obj.serialize()
+    elif isinstance(obj, bytes):
+        bytes_obj = BytesData(obj)
+        return bytes_obj.serialize()
+    elif isinstance(obj, (dict, list, int, float, bool, type(None))):
+        json_obj = JsonData(obj)
+        return json_obj.serialize()
+    else:
+        raise ValueError(f"No serializer found for type: {type(obj)}")
+
+
+def deserialize_object(combined: bytes) -> Any:
+    """
+    Deserialize from combined metadata+payload bytes.
+    
+    The combined format is metadata_json (UTF-8 text) + payload (binary).
+    This function finds where the JSON ends and splits appropriately.
+    
+    Args:
+        combined: Combined metadata+payload bytes
+        
+    Returns:
+        Deserialized Python object (numpy array, PIL Image, str, dict, etc.)
+    """
+    # Find the end of JSON by parsing
+    combined_str = combined.decode('utf-8', errors='ignore')
+    
+    # Parse JSON to find its end
+    depth = 0
+    in_string = False
+    escape = False
+    json_end = 0
+    
+    for i, c in enumerate(combined_str):
+        if escape:
+            escape = False
+            continue
+        
+        if c == '\\':
+            escape = True
+            continue
+        
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        
+        if in_string:
+            continue
+        
+        if c in ('{', '['):
+            depth += 1
+        elif c in ('}', ']'):
+            depth -= 1
+            if depth == 0:
+                json_end = i + 1
+                break
+    
+    if json_end == 0:
+        raise ValueError("Could not find end of JSON metadata")
+    
+    # Split metadata and payload
+    metadata_json = combined[:json_end].decode('utf-8')
+    payload = combined[json_end:]
+    
+    # Deserialize
+    obj = deserialize(metadata_json, payload)
+    
+    # Convert to native Python types
+    if isinstance(obj, NumpyArray):
+        return obj.to_array()
+    elif isinstance(obj, ImageData):
+        return obj.to_image()
+    elif isinstance(obj, JsonData):
+        return obj.json()
+    elif isinstance(obj, TextData):
+        return obj.text
+    elif isinstance(obj, BytesData):
+        return obj.bytes
+    else:
+        return obj
+
+
+# Backward compatibility - old serializer classes
 SERIALIZERS = {
-    'ndarray': NumpySerializer,
-    'image': ImageSerializer,
-    'text': TextSerializer,
-    'json': JsonSerializer,
-    'bytes': BytesSerializer,
+    'ndarray': NumpyArray,
+    'image': ImageData,
+    'text': TextData,
+    'json': JsonData,
+    'bytes': BytesData,
 }
 
 
-def get_serializer(obj: Any) -> ObjectSerializer:
-    """
-    Get appropriate serializer for an object.
-    
-    Args:
-        obj: Object to serialize
-        
-    Returns:
-        Serializer class
-        
-    Raises:
-        ValueError: If no suitable serializer found
-    """
-    if isinstance(obj, np.ndarray):
-        return NumpySerializer
-    elif isinstance(obj, Image.Image):
-        return ImageSerializer
+def get_serializer(obj: Any):
+    """Get appropriate serializer class for an object (backward compatibility)"""
+    if HAS_NUMPY and isinstance(obj, np.ndarray):
+        return NumpyArray
+    elif HAS_PIL and isinstance(obj, Image.Image):
+        return ImageData
     elif isinstance(obj, str):
-        return TextSerializer
+        return TextData
     elif isinstance(obj, bytes):
-        return BytesSerializer
+        return BytesData
     elif isinstance(obj, (dict, list, int, float, bool, type(None))):
-        return JsonSerializer
+        return JsonData
     else:
         raise ValueError(f"No serializer found for type: {type(obj)}")

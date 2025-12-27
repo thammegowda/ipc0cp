@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from ipc0cp.ring_buffer import SharedRingBufferProducer, SharedRingBufferConsumer
+from ipc0cp.ipc import IPCException, IPCError
 
 
 class TestSharedRingBufferBlocking:
@@ -45,7 +46,7 @@ class TestSharedRingBufferBlocking:
             producer.unlink()
     
     def test_buffer_empty_nonblocking(self):
-        """Test that consumer returns None when buffer is empty and non-blocking."""
+        """Test that consumer raises exception when buffer is empty and non-blocking."""
         shm_name = "test_empty_nonblocking"
         
         # Create the shared memory first with a producer
@@ -62,9 +63,10 @@ class TestSharedRingBufferBlocking:
         )
         
         try:
-            # Try to pop from empty buffer
-            result = consumer.pop()
-            assert result is None
+            # Try to pop from empty buffer - should raise exception
+            with pytest.raises(IPCException) as exc_info:
+                consumer.pop()
+            assert exc_info.value.error_type == IPCError.BUFFER_EMPTY
         finally:
             consumer.close()
             producer.close()
@@ -89,10 +91,12 @@ class TestSharedRingBufferBlocking:
         
         try:
             start = time.time()
-            result = consumer.pop(timeout=0.5)
+            # Should raise timeout exception
+            with pytest.raises(IPCException) as exc_info:
+                consumer.pop(timeout=0.5)
             elapsed = time.time() - start
             
-            assert result is None
+            assert exc_info.value.error_type == IPCError.TIMEOUT
             assert 0.4 < elapsed < 0.7  # Should wait approximately 0.5 seconds
         finally:
             consumer.close()

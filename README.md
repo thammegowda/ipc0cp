@@ -76,9 +76,9 @@ buffer.unlink()  # Cleanup
 ### Architecture
 
 The ring buffer uses a hybrid linked-list design with data integrity checking:
-- **Header (24 bytes)**: Contains `write_offset`, `read_offset`, and `total_data_bytes` for O(1) space checking
+- **Header (24 bytes)**: Contains `write_pos`, `read_pos`, and `total_data_bytes` for O(1) space checking
 - **Variable slots**: Each slot contains:
-  - **Slot header (20 bytes)**: `next_offset` (8 bytes), `metadata_size` (4 bytes), `payload_size` (8 bytes)
+  - **Slot header (20 bytes)**: `next_pos` (8 bytes), `metadata_size` (4 bytes), `payload_size` (8 bytes)
   - **Metadata**: JSON metadata (max 1024 bytes)
   - **Start sentinel (1 byte)**: Null byte (0x00) for integrity checking
   - **Payload**: Binary data
@@ -90,11 +90,11 @@ The ring buffer uses a hybrid linked-list design with data integrity checking:
 ### Memory Layout
 
 ```
-[Header: write_offset | read_offset | total_data_bytes]
+[Header: write_pos | read_pos | total_data_bytes]
 [Data Region: Slot₀ → Slot₁ → Slot₂ → ...]
 
 Each Slot:
-  next_offset (8 bytes)
+  next_pos (8 bytes)
   metadata_size (4 bytes)  
   payload_size (8 bytes)
   metadata_json (up to 1024 bytes)
@@ -161,6 +161,39 @@ pytest python/ipc0cp/tests/ --cov=ipc0cp --cov-report=html
 # Run specific test class
 pytest python/ipc0cp/tests/test_ring_buffer.py::TestSharedRingBufferGenericObjects -v
 ```
+
+## Logging
+
+Both Python and C++ implementations include optional logging for debugging:
+
+### Python
+
+```python
+import ipc0cp
+
+# Enable INFO level logging to stderr
+ipc0cp.enable_logging()
+
+# Set specific log level
+ipc0cp.set_log_level('DEBUG')  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# Disable logging
+ipc0cp.disable_logging()
+```
+
+### C++
+
+```cpp
+#include "ipc0cp/logger.hpp"
+
+// Enable logging to stderr
+ipc0cp::enable_logging();
+
+// Disable logging  
+ipc0cp::disable_logging();
+```
+
+**Note**: Logging is **disabled by default** to avoid polluting stdout/stderr in production use.
 
 ## Examples
 
