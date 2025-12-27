@@ -1,0 +1,242 @@
+{
+  "config": {
+    "runs": 3,
+    "duration": 10.0,
+    "min_size": 524288,
+    "max_size": 5242880,
+    "include_cpp": true
+  },
+  "stdio_raw": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 247.72,
+        "consumer_throughput_mbps": 247.89,
+        "producer_bytes": 2600739373,
+        "consumer_bytes": 2600739373,
+        "producer_messages": 881,
+        "consumer_messages": 881
+      },
+      {
+        "producer_throughput_mbps": 369.54,
+        "consumer_throughput_mbps": 369.76,
+        "producer_bytes": 3875202343,
+        "consumer_bytes": 3875202343,
+        "producer_messages": 1335,
+        "consumer_messages": 1335
+      },
+      {
+        "producer_throughput_mbps": 328.05,
+        "consumer_throughput_mbps": 328.2,
+        "producer_bytes": 3442583848,
+        "consumer_bytes": 3442583848,
+        "producer_messages": 1203,
+        "consumer_messages": 1203
+      }
+    ],
+    "available": true,
+    "producer_mean": 315.10333333333335,
+    "producer_stddev": 61.933353157513885,
+    "consumer_mean": 315.2833333333333,
+    "consumer_stddev": 61.95324392905777
+  },
+  "stdio_api": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 329.89,
+        "consumer_throughput_mbps": 329.63,
+        "producer_bytes": 3461869435,
+        "consumer_bytes": 3461869435,
+        "producer_messages": 1186,
+        "consumer_messages": 1186
+      },
+      {
+        "producer_throughput_mbps": 379.15,
+        "consumer_throughput_mbps": 379.56,
+        "producer_bytes": 3979254166,
+        "consumer_bytes": 3979254166,
+        "producer_messages": 1384,
+        "consumer_messages": 1384
+      },
+      {
+        "producer_throughput_mbps": 301.04,
+        "consumer_throughput_mbps": 301.27,
+        "producer_bytes": 3157565316,
+        "consumer_bytes": 3157565316,
+        "producer_messages": 1120,
+        "consumer_messages": 1120
+      }
+    ],
+    "available": true,
+    "producer_mean": 336.6933333333333,
+    "producer_stddev": 39.496924352831975,
+    "consumer_mean": 336.82,
+    "consumer_stddev": 39.637142934374076
+  },
+  "shm": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 437.53,
+        "consumer_throughput_mbps": 451.92,
+        "producer_bytes": 4588481956,
+        "consumer_bytes": 4588481956,
+        "producer_messages": 1621,
+        "consumer_messages": 1621
+      },
+      {
+        "producer_throughput_mbps": 521.08,
+        "consumer_throughput_mbps": 538.17,
+        "producer_bytes": 5464457792,
+        "consumer_bytes": 5464457792,
+        "producer_messages": 1894,
+        "consumer_messages": 1894
+      },
+      {
+        "producer_throughput_mbps": 439.14,
+        "consumer_throughput_mbps": 454.27,
+        "producer_bytes": 4606151178,
+        "consumer_bytes": 4606151178,
+        "producer_messages": 1638,
+        "consumer_messages": 1638
+      }
+    ],
+    "available": true,
+    "producer_mean": 465.9166666666667,
+    "producer_stddev": 47.779629899501494,
+    "consumer_mean": 481.4533333333333,
+    "consumer_stddev": 49.13212628548993
+  },
+  "cpp_stdio": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 696.047,
+        "consumer_throughput_mbps": 696.048,
+        "producer_bytes": 7300605137,
+        "consumer_bytes": 7300605137,
+        "producer_messages": 2504,
+        "consumer_messages": 2504
+      },
+      {
+        "producer_throughput_mbps": 702.017,
+        "consumer_throughput_mbps": 702.026,
+        "producer_bytes": 7366153173,
+        "consumer_bytes": 7366153173,
+        "producer_messages": 2607,
+        "consumer_messages": 2607
+      },
+      {
+        "producer_throughput_mbps": 699.796,
+        "consumer_throughput_mbps": 699.794,
+        "producer_bytes": 7339158121,
+        "consumer_bytes": 7339158121,
+        "producer_messages": 2572,
+        "consumer_messages": 2572
+      }
+    ],
+    "available": true,
+    "producer_mean": 699.2866666666667,
+    "producer_stddev": 3.0174145113546165,
+    "consumer_mean": 699.2893333333333,
+    "consumer_stddev": 3.0207842248881653
+  },
+  "cpp_shm": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 2108.69,
+        "consumer_throughput_mbps": 2072.49,
+        "producer_bytes": 22158994891,
+        "consumer_bytes": 22158994891,
+        "producer_messages": 7591,
+        "consumer_messages": 7591
+      },
+      {
+        "producer_throughput_mbps": 2251.24,
+        "consumer_throughput_mbps": 2212.95,
+        "producer_bytes": 23657295634,
+        "consumer_bytes": 23657295634,
+        "producer_messages": 8181,
+        "consumer_messages": 8181
+      },
+      {
+        "producer_throughput_mbps": 2218.87,
+        "consumer_throughput_mbps": 2181.21,
+        "producer_bytes": 23318912019,
+        "consumer_bytes": 23318912019,
+        "producer_messages": 8091,
+        "consumer_messages": 8091
+      }
+    ],
+    "available": true,
+    "producer_mean": 2192.9333333333334,
+    "producer_stddev": 74.73057361838804,
+    "consumer_mean": 2155.5499999999997,
+    "consumer_stddev": 73.66192775104388
+  },
+  "py_cpp_stdio": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 318.34,
+        "consumer_throughput_mbps": 314.958,
+        "producer_bytes": 3339625515,
+        "consumer_bytes": 3339625515,
+        "producer_messages": 1181,
+        "consumer_messages": 1181
+      },
+      {
+        "producer_throughput_mbps": 320.44,
+        "consumer_throughput_mbps": 317.513,
+        "producer_bytes": 3362898817,
+        "consumer_bytes": 3362898817,
+        "producer_messages": 1159,
+        "consumer_messages": 1159
+      },
+      {
+        "producer_throughput_mbps": 373.52,
+        "consumer_throughput_mbps": 317.946,
+        "producer_bytes": 3919589665,
+        "consumer_bytes": 3919589665,
+        "producer_messages": 1384,
+        "consumer_messages": 1384
+      }
+    ],
+    "available": true,
+    "producer_mean": 337.43333333333334,
+    "producer_stddev": 31.26960398427414,
+    "consumer_mean": 316.8056666666667,
+    "consumer_stddev": 1.6147062684381013
+  },
+  "py_cpp_shm": {
+    "runs": [
+      {
+        "producer_throughput_mbps": 439.56,
+        "consumer_throughput_mbps": 427.476,
+        "producer_bytes": 4611586225,
+        "consumer_bytes": 4611586225,
+        "producer_messages": 1603,
+        "consumer_messages": 1603
+      },
+      {
+        "producer_throughput_mbps": 429.56,
+        "consumer_throughput_mbps": 417.027,
+        "producer_bytes": 4504371767,
+        "consumer_bytes": 4504371767,
+        "producer_messages": 1529,
+        "consumer_messages": 1529
+      },
+      {
+        "producer_throughput_mbps": 514.84,
+        "consumer_throughput_mbps": 431.059,
+        "producer_bytes": 5401880529,
+        "consumer_bytes": 5401880529,
+        "producer_messages": 1881,
+        "consumer_messages": 1881
+      }
+    ],
+    "available": true,
+    "producer_mean": 461.32,
+    "producer_stddev": 46.61858856722286,
+    "consumer_mean": 425.18733333333336,
+    "consumer_stddev": 7.290593414347942
+  },
+  "speedup_vs_stdio_raw": 1.5270497436168526,
+  "speedup_vs_stdio_api": 1.429408388258813
+}

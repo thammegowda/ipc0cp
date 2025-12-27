@@ -4,7 +4,9 @@ Zero-copy (0CP) inter-process communication (IPC): A library for exchanging data
 
 ## Overview
 
-`ipc0cp` is a library that enables efficient data exchange between Python and C++ processes using shared memory for zero-copy inter-process communication. This approach minimizes overhead and maximizes performance when transferring data between processes written in different languages.
+`ipc0cp` is a library that enables efficient data exchange between processes (in Python and C++) using shared memory for zero-copy inter-process communication. This approach minimizes overhead and maximizes performance when transferring data between processes written in different languages. 
+Also included STDIO (not zero-copy) for comparison and convenience.
+
 
 ## Features
 
@@ -15,6 +17,56 @@ Zero-copy (0CP) inter-process communication (IPC): A library for exchanging data
 - **Blocking/non-blocking modes**: Configurable wait behavior for producer and consumer
 - **Simple API**: Easy-to-use Python interface with C++20 consumer implementation
 - **Cross-language IPC**: Python producer can communicate with C++ consumer and vice versa
+
+
+### Benchmarks:
+See `benchmarks/` dir for more info.
+```
+python benchmarks/run_benchmark.py --duration 10
+================================================================================
+IPC BENCHMARK: STDIO vs Shared Memory
+================================================================================
+  Runs: 3
+  Duration: 10.0s
+  Payload size range: 512KB - 5.0MB
+  Include C++: True
+
+Running Python STDIO (raw) benchmarks...
+  Run 1/3... Producer: 247.72 MB/s, Consumer: 247.89 MB/s
+  Run 2/3... Producer: 369.54 MB/s, Consumer: 369.76 MB/s
+  Run 3/3... Producer: 328.05 MB/s, Consumer: 328.20 MB/s
+
+Running Python STDIO (API) benchmarks...
+  Run 1/3... Producer: 329.89 MB/s, Consumer: 329.63 MB/s
+  Run 2/3... Producer: 379.15 MB/s, Consumer: 379.56 MB/s
+  Run 3/3... Producer: 301.04 MB/s, Consumer: 301.27 MB/s
+
+Running Python Shared Memory benchmarks...
+  Run 1/3... Producer: 437.53 MB/s, Consumer: 451.92 MB/s
+  Run 2/3... Producer: 521.08 MB/s, Consumer: 538.17 MB/s
+  Run 3/3... Producer: 439.14 MB/s, Consumer: 454.27 MB/s
+
+Running C++ STDIO (API) benchmarks...
+  Run 1/3... Producer: 696.05 MB/s, Consumer: 696.05 MB/s
+  Run 2/3... Producer: 702.02 MB/s, Consumer: 702.03 MB/s
+  Run 3/3... Producer: 699.80 MB/s, Consumer: 699.79 MB/s
+
+Running C++ Shared Memory benchmarks...
+  Run 1/3... Producer: 2108.69 MB/s, Consumer: 2072.49 MB/s
+  Run 2/3... Producer: 2251.24 MB/s, Consumer: 2212.95 MB/s
+  Run 3/3... Producer: 2218.87 MB/s, Consumer: 2181.21 MB/s
+
+Running Python -> C++ STDIO (API) benchmarks...
+  Run 1/3... Producer: 318.34 MB/s, Consumer: 314.96 MB/s
+  Run 2/3... Producer: 320.44 MB/s, Consumer: 317.51 MB/s
+  Run 3/3... Producer: 373.52 MB/s, Consumer: 317.95 MB/s
+
+Running Python -> C++ Shared Memory benchmarks...
+  Run 1/3... Producer: 439.56 MB/s, Consumer: 427.48 MB/s
+  Run 2/3... Producer: 429.56 MB/s, Consumer: 417.03 MB/s
+  Run 3/3... Producer: 514.84 MB/s, Consumer: 431.06 MB/s
+```
+
 
 ## Python Ring Buffer
 

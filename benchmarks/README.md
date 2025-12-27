@@ -2,13 +2,6 @@
 
 This directory contains benchmarking tools to compare the performance of shared memory IPC against STDIN/STDOUT baseline.
 
-## Features
-
-- **End-of-Stream Signaling**: Producer explicitly signals completion with EOS marker (payload_size=0)
-- **Exception-Based Error Handling**: Consumer throws `RingBufferException` for errors, returns `None` only for clean EOS
-- **Pure Payload Measurement**: Throughput measures only actual data, excluding metadata/sentinels/overhead
-- **Statistical Analysis**: Multiple runs with mean/stddev reporting
-
 ## Files
 
 - **producer.py**: Sends random bytes via STDIO or shared memory
