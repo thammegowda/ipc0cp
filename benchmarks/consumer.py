@@ -15,9 +15,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from ipc0cp.ring_buffer import SharedRingBufferConsumer
 from ipc0cp import IPCException
+from ipc0cp.stdio import StdioConsumer
 
 
-def consume_stdio() -> dict:
+def consume_stdio_raw() -> dict:
     """
     Consume random bytes via STDIN (binary mode) until EOF.
     
@@ -122,13 +123,44 @@ def consume_shm(shm_name: str) -> dict:
     finally:
         consumer.close()
 
+def consume_stdio_api() -> dict:
+    """Consume messages via StdioConsumer rather than raw reads."""
+
+    consumer = StdioConsumer()
+    bytes_received = 0
+    messages_received = 0
+    start_time = time.time()
+
+    while True:
+        obj = consumer.pop()
+        if obj is None:
+            break
+
+        if isinstance(obj, (bytes, bytearray)):
+            size = len(obj)
+        else:
+            size = len(str(obj).encode('utf-8'))
+
+        bytes_received += size
+        messages_received += 1
+
+    elapsed_time = time.time() - start_time
+
+    return {
+        'bytes_received': bytes_received,
+        'messages_received': messages_received,
+        'elapsed_time': elapsed_time,
+        'throughput_mbps': (bytes_received / elapsed_time) / (1024 * 1024),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(description='Benchmark consumer')
     
     # Transport mode
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--stdio', action='store_true', help='Use STDIN/STDOUT')
+    group.add_argument('--stdio', action='store_true', help='Use raw STDIN/STDOUT framing')
+    group.add_argument('--stdio-api', action='store_true', help='Use StdioConsumer API for framed I/O')
     group.add_argument('--shm', type=str, help='Shared memory segment name')
     
     # Benchmark parameters
@@ -141,13 +173,15 @@ def main():
         print(f"Consumer starting...", file=sys.stderr)
     
     if args.stdio:
-        stats = consume_stdio()
+        stats = consume_stdio_raw()
+    elif args.stdio_api:
+        stats = consume_stdio_api()
     else:
         stats = consume_shm(args.shm)
     
     # Print stats to stderr
     print(f"\nConsumer Stats:", file=sys.stderr)
-    print(f"  Bytes received: {stats['bytes_received']:,} ({stats['bytes_received'] / (1024**3):.2f} GB)", file=sys.stderr)
+    print(f"  Bytes received (payload only): {stats['bytes_received']:,} ({stats['bytes_received'] / (1024**3):.2f} GB)", file=sys.stderr)
     print(f"  Messages received: {stats['messages_received']:,}", file=sys.stderr)
     print(f"  Elapsed time: {stats['elapsed_time']:.2f} seconds", file=sys.stderr)
     print(f"  Throughput: {stats['throughput_mbps']:.2f} MB/s", file=sys.stderr)

@@ -15,9 +15,10 @@ from typing import Optional
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'python'))
 
 from ipc0cp.ring_buffer import SharedRingBufferProducer
+from ipc0cp.stdio import StdioProducer
 
 
-def produce_stdio(min_size: int, max_size: int, duration: float) -> dict:
+def produce_stdio_raw(min_size: int, max_size: int, duration: float) -> dict:
     """
     Produce random bytes via STDOUT (binary mode).
     
@@ -132,12 +133,45 @@ def produce_shm(shm_name: str, min_size: int, max_size: int, duration: float) ->
         producer.unlink()
 
 
+def produce_stdio_api(min_size: int, max_size: int, duration: float) -> dict:
+    """Produce random bytes via the IPC stdio API."""
+
+    producer = StdioProducer()
+    bytes_sent = 0
+    messages_sent = 0
+    start_time = time.time()
+
+    try:
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= duration:
+                break
+
+            size = random.randint(min_size, max_size)
+            payload = os.urandom(size)
+
+            producer.push(payload)
+            bytes_sent += size
+            messages_sent += 1
+
+        elapsed_time = time.time() - start_time
+        return {
+            'bytes_sent': bytes_sent,
+            'messages_sent': messages_sent,
+            'elapsed_time': elapsed_time,
+            'throughput_mbps': (bytes_sent / elapsed_time) / (1024 * 1024),
+        }
+    finally:
+        producer.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Benchmark producer')
     
     # Transport mode
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--stdio', action='store_true', help='Use STDIN/STDOUT')
+    group.add_argument('--stdio', action='store_true', help='Use raw STDIN/STDOUT framing')
+    group.add_argument('--stdio-api', action='store_true', help='Use StdioProducer API for framed I/O')
     group.add_argument('--shm', type=str, help='Shared memory segment name')
     
     # Benchmark parameters
@@ -157,13 +191,15 @@ def main():
               file=sys.stderr)
     
     if args.stdio:
-        stats = produce_stdio(args.min_size, args.max_size, args.duration)
+        stats = produce_stdio_raw(args.min_size, args.max_size, args.duration)
+    elif args.stdio_api:
+        stats = produce_stdio_api(args.min_size, args.max_size, args.duration)
     else:
         stats = produce_shm(args.shm, args.min_size, args.max_size, args.duration)
     
     # Print stats to stderr so it doesn't interfere with STDIO mode
     print(f"\nProducer Stats:", file=sys.stderr)
-    print(f"  Bytes sent: {stats['bytes_sent']:,} ({stats['bytes_sent'] / (1024**3):.2f} GB)", file=sys.stderr)
+    print(f"  Bytes sent (payload only): {stats['bytes_sent']:,} ({stats['bytes_sent'] / (1024**3):.2f} GB)", file=sys.stderr)
     print(f"  Messages sent: {stats['messages_sent']:,}", file=sys.stderr)
     print(f"  Elapsed time: {stats['elapsed_time']:.2f} seconds", file=sys.stderr)
     print(f"  Throughput: {stats['throughput_mbps']:.2f} MB/s", file=sys.stderr)
