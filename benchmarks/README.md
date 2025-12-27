@@ -1,98 +1,111 @@
 # Benchmarks
 
-This directory contains benchmarking tools to compare the performance of shared memory IPC against STDIN/STDOUT baseline.
+This directory contains a benchmark harness to compare:
+
+- **Shared memory (SHM)**: the “0CP” transport (data crosses processes via POSIX shared memory)
+- **STDIO**: not zero-copy; included as a baseline
+
+The benchmarks are intentionally simple: they send **random byte payloads** (no compression, no application logic) and report throughput.
+
+## What’s being measured (and what isn’t)
+
+- The reported throughput is **payload bytes only** (it excludes metadata and framing overhead).
+- SHM avoids stdin/stdout piping and is meant to approximate a “zero-copy transport” baseline across processes.
+- STDIO is not zero-copy and includes kernel buffering/copies; it’s here as a convenient baseline.
+
+This benchmark does not attempt to model end-to-end application behavior (e.g., preprocessing, model inference). It’s a transport comparison.
 
 ## Files
 
-- **producer.py**: Sends random bytes via STDIO or shared memory
-- **consumer.py**: Receives random bytes via STDIO or shared memory  
-- **run_benchmark.py**: Orchestrates benchmark runs and reports statistics
-- **quick_test.sh**: Quick 5-second test to verify everything works
+- `producer.py`: produces random bytes over STDIO or SHM
+- `consumer.py`: consumes random bytes over STDIO or SHM
+- `run_benchmark.py`: orchestrates multiple variants and aggregates results
+- `quick_test.sh`: quick sanity check run
 
-## Usage
-
-### Quick Test
-
-Verify the benchmark suite works (5 second test):
-
-```bash
-cd benchmarks
-chmod +x quick_test.sh
-./quick_test.sh
-```
-
-### Quick Start
-
-Run full benchmark suite (3 runs of 60 seconds each for both STDIO and shared memory):
+## Quick start
 
 ```bash
 cd benchmarks
 python run_benchmark.py
 ```
 
-### Custom Configuration
+Customize duration/runs/payload sizes:
 
 ```bash
-# Run 5 times with 30-second duration per run
-python run_benchmark.py --runs 5 --duration 30
-
-# Use different payload sizes (1MB to 10MB)
+python run_benchmark.py --runs 3 --duration 10
 python run_benchmark.py --min-size 1048576 --max-size 10485760
-
-# Short test run (1 run, 10 seconds)
-python run_benchmark.py --runs 1 --duration 10
 ```
 
-### Manual Testing
+Disable C++ variants (Python-only):
 
-Test STDIO mode:
 ```bash
-python producer.py --stdio --duration 10 | python consumer.py --stdio --duration 15
+python run_benchmark.py --no-cpp
 ```
 
-Test shared memory mode:
-```bash
-# Terminal 1 (consumer)
-python consumer.py --shm test_bench --duration 15
+## Benchmark variants
 
-# Terminal 2 (producer)
-python producer.py --shm test_bench --duration 10
-```
+When C++ binaries are available, the harness runs:
 
-### C++ Benchmarks
+- **Python STDIO (raw)**: raw framing only (`[uint64 length][payload]`)
+- **Python STDIO (API)**: uses `ipc0cp.StdioProducer` / `ipc0cp.StdioConsumer` (JSON metadata + payload framing)
+- **Python Shared Memory**: uses `ipc0cp.SharedRingBufferProducer` / `ipc0cp.SharedRingBufferConsumer`
+- **C++ STDIO (API)**: C++ producer/consumer using the same framed format
+- **C++ Shared Memory**: C++ producer/consumer using the SHM ring buffer
+- **Python -> C++ STDIO (API)**: Python producer piped into C++ consumer
+- **Python -> C++ Shared Memory**: Python producer + C++ consumer via SHM
 
-The STDIO API is also available as native C++ producers/consumers. Build them once (from the benchmarks directory) and then enable them in the Python harness:
+If the C++ binaries are missing, `run_benchmark.py` prints a warning and automatically falls back to Python-only.
+
+## Building the C++ benchmark binaries
 
 ```bash
 cd benchmarks
-cmake -S . -B build
-cmake --build build
-python run_benchmark.py --include-cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-## Metrics
+The harness expects binaries in `benchmarks/build/bin/`.
 
-The benchmark measures:
+## Manual runs
 
-- **Throughput (MB/s)**: Data transfer rate excluding metadata overhead
-- **Bytes transferred**: Total payload bytes (no headers, sentinels, metadata)
-- **Messages**: Number of individual payloads sent/received
-- **Mean and StdDev**: Statistical summary across multiple runs
-- **Speedup**: How much faster shared memory is compared to STDIO
+Raw STDIO (Python → Python):
 
-## Default Parameters
+```bash
+python producer.py --stdio --duration 10 | python consumer.py --stdio
+```
 
-- Payload size: 512KB to 5MB (randomized per message)
-- Buffer size: 2GB shared memory
-- Duration: 60 seconds per run
-- Runs: 3 iterations per benchmark
-- Timeout: 5 seconds for blocking operations
+Framed STDIO API (Python → Python):
+
+```bash
+python producer.py --stdio-api --duration 10 | python consumer.py --stdio-api
+```
+
+Shared memory (two processes):
+
+```bash
+# Terminal 1
+python consumer.py --shm test_bench
+
+# Terminal 2
+python producer.py --shm test_bench --duration 10
+```
 
 ## Output
 
-Results are displayed on screen and saved to JSON:
+Results are printed to the console and saved as JSON:
+
 ```
 benchmark_results_<timestamp>.json
 ```
 
-The JSON file contains detailed statistics for all runs, making it easy to analyze or visualize the data later.
+The JSON includes:
+
+- config (runs, duration, min/max sizes, include_cpp)
+- per-variant per-run stats (producer/consumer bytes/messages/throughput)
+- summary stats (mean/stddev)
+- speedups (SHM vs STDIO raw and SHM vs STDIO API)
+
+## Notes and gotchas
+
+- SHM uses a large shared memory segment (2GB by default in the benchmark scripts). Ensure you have enough shared memory available.
+- If a run crashes, you may need to clean up leftover segments under `/dev/shm/` (Linux).

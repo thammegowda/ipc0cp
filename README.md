@@ -4,264 +4,166 @@ Zero-copy (0CP) inter-process communication (IPC): A library for exchanging data
 
 ## Overview
 
-`ipc0cp` is a library that enables efficient data exchange between processes (in Python and C++) using shared memory for zero-copy inter-process communication. This approach minimizes overhead and maximizes performance when transferring data between processes written in different languages. 
-Also included STDIO (not zero-copy) for comparison and convenience.
+`ipc0cp` is an IPC library focused on fast, practical data exchange between processes in **Python** and **C++**.
 
+It ships two transports:
+
+- **Shared memory ring buffer (SHM)**: the high-performance path. Payloads are exchanged via POSIX shared memory.
+  This is the “0CP” transport (no stdin/stdout piping, no pipe-buffer copies).
+- **STDIO framed transport**: *not* zero-copy. Included as a baseline and for convenience/portability.
 
 ## Features
 
-- **Zero-copy data transfer**: Uses shared memory to avoid expensive data copying
-- **Lock-free ring buffer**: Single-producer/single-consumer design for high performance
-- **Variable-size slots**: Efficient memory usage with support for objects of different sizes
-- **Generic object support**: Exchange NumPy arrays, PIL Images, text, JSON, and raw bytes
-- **Blocking/non-blocking modes**: Configurable wait behavior for producer and consumer
-- **Simple API**: Easy-to-use Python interface with C++20 consumer implementation
-- **Cross-language IPC**: Python producer can communicate with C++ consumer and vice versa
+- **SPSC lock-free design**: single producer + single consumer.
+- **Variable-size slots**: payload sizes can vary per message.
+- **Unified wire format**: both transports use JSON metadata + binary payload framing.
+- **Generic object support**: bytes, UTF-8 text, JSON, NumPy arrays, PIL images.
+- **EOS marker**: producers can signal a clean end-of-stream.
+- **Blocking / non-blocking**: optional timeouts for push/pop.
+- **Data integrity checks**: sentinel bytes around payloads detect corruption/overruns.
 
+For a deeper dive into the memory layout, see `ARCHITECTURE.md`.
 
-### Benchmarks:
-See `benchmarks/` dir for more info.
-```
-python benchmarks/run_benchmark.py --duration 10
-================================================================================
-IPC BENCHMARK: STDIO vs Shared Memory
-================================================================================
-  Runs: 3
-  Duration: 10.0s
-  Payload size range: 512KB - 5.0MB
-  Include C++: True
+## Python API
 
-Running Python STDIO (raw) benchmarks...
-  Run 1/3... Producer: 247.72 MB/s, Consumer: 247.89 MB/s
-  Run 2/3... Producer: 369.54 MB/s, Consumer: 369.76 MB/s
-  Run 3/3... Producer: 328.05 MB/s, Consumer: 328.20 MB/s
+The current public API is split into producer/consumer roles:
 
-Running Python STDIO (API) benchmarks...
-  Run 1/3... Producer: 329.89 MB/s, Consumer: 329.63 MB/s
-  Run 2/3... Producer: 379.15 MB/s, Consumer: 379.56 MB/s
-  Run 3/3... Producer: 301.04 MB/s, Consumer: 301.27 MB/s
+- SHM: `SharedRingBufferProducer` / `SharedRingBufferConsumer`
+- STDIO: `StdioProducer` / `StdioConsumer`
 
-Running Python Shared Memory benchmarks...
-  Run 1/3... Producer: 437.53 MB/s, Consumer: 451.92 MB/s
-  Run 2/3... Producer: 521.08 MB/s, Consumer: 538.17 MB/s
-  Run 3/3... Producer: 439.14 MB/s, Consumer: 454.27 MB/s
+### Shared memory quickstart
 
-Running C++ STDIO (API) benchmarks...
-  Run 1/3... Producer: 696.05 MB/s, Consumer: 696.05 MB/s
-  Run 2/3... Producer: 702.02 MB/s, Consumer: 702.03 MB/s
-  Run 3/3... Producer: 699.80 MB/s, Consumer: 699.79 MB/s
+Producer (process 1):
 
-Running C++ Shared Memory benchmarks...
-  Run 1/3... Producer: 2108.69 MB/s, Consumer: 2072.49 MB/s
-  Run 2/3... Producer: 2251.24 MB/s, Consumer: 2212.95 MB/s
-  Run 3/3... Producer: 2218.87 MB/s, Consumer: 2181.21 MB/s
-
-Running Python -> C++ STDIO (API) benchmarks...
-  Run 1/3... Producer: 318.34 MB/s, Consumer: 314.96 MB/s
-  Run 2/3... Producer: 320.44 MB/s, Consumer: 317.51 MB/s
-  Run 3/3... Producer: 373.52 MB/s, Consumer: 317.95 MB/s
-
-Running Python -> C++ Shared Memory benchmarks...
-  Run 1/3... Producer: 439.56 MB/s, Consumer: 427.48 MB/s
-  Run 2/3... Producer: 429.56 MB/s, Consumer: 417.03 MB/s
-  Run 3/3... Producer: 514.84 MB/s, Consumer: 431.06 MB/s
-```
-
-
-## Python Ring Buffer
-
-The Python implementation provides a `SharedRingBuffer` class for inter-process communication:
-
-### Supported Object Types
-
-- **NumPy arrays** - Multi-dimensional arrays for images, tensors, scientific data
-- **PIL Images** - Python Imaging Library images  
-- **Text strings** - UTF-8 encoded text
-- **JSON objects** - Dictionaries, lists, and primitive types
-- **Raw bytes** - Binary data
-
-### Quick Start
-
-**Producer (Process 1):**
 ```python
-from ipc0cp import SharedRingBuffer
 import numpy as np
+from ipc0cp import SharedRingBufferProducer
 
-# Create ring buffer
-buffer = SharedRingBuffer(
+producer = SharedRingBufferProducer(
     shm_name="my_buffer",
-    total_data_bytes=100 * 1024 * 1024,  # 100 MB
-    create=True
+    total_data_bytes=256 * 1024 * 1024,
+    blocking=True,
 )
 
-# Push different types of objects
-buffer.push(np.random.rand(480, 640, 3))  # NumPy array
-buffer.push("Hello, World!")               # Text
-buffer.push({"frame": 1, "data": [1,2,3]}) # JSON
-buffer.push(b"Binary data")                # Bytes
+producer.push(np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8))
+producer.push({"msg": "hello", "id": 123})
+producer.push(b"raw bytes")
 
-buffer.close()
+producer.close()   # sends EOS
+producer.unlink()  # delete shared memory segment
 ```
 
-**Consumer (Process 2):**
+Consumer (process 2):
+
 ```python
-from ipc0cp import SharedRingBuffer
+from ipc0cp import SharedRingBufferConsumer
 
-# Attach to existing buffer
-buffer = SharedRingBuffer(
+consumer = SharedRingBufferConsumer(
     shm_name="my_buffer",
-    total_data_bytes=100 * 1024 * 1024,
-    create=False
+    total_data_bytes=256 * 1024 * 1024,
+    blocking=True,
+    auto_attach=True,
+    auto_unlink=False,
 )
 
-# Pop objects
 while True:
-    obj = buffer.pop(timeout=5.0)
-    if obj is None:
+    obj = consumer.pop(timeout=5.0)
+    if obj is None:  # EOS
         break
-    print(f"Received: {type(obj)}")
+    print(type(obj))
 
-buffer.close()
-buffer.unlink()  # Cleanup
+consumer.close()
+consumer.unlink()  # optional cleanup
 ```
 
-### Architecture
+### STDIO quickstart
 
-The ring buffer uses a hybrid linked-list design with data integrity checking:
-- **Header (24 bytes)**: Contains `write_pos`, `read_pos`, and `total_data_bytes` for O(1) space checking
-- **Variable slots**: Each slot contains:
-  - **Slot header (20 bytes)**: `next_pos` (8 bytes), `metadata_size` (4 bytes), `payload_size` (8 bytes)
-  - **Metadata**: JSON metadata (max 1024 bytes)
-  - **Start sentinel (1 byte)**: Null byte (0x00) for integrity checking
-  - **Payload**: Binary data
-  - **End sentinel (1 byte)**: Null byte (0x00) for integrity checking
-- **Sentinel bytes**: Null bytes before and after payload detect buffer overruns and data corruption
-- **Circular buffer**: Automatic wraparound for continuous operation
-- **Lock-free**: Single producer and single consumer operate without locks
-
-### Memory Layout
-
-```
-[Header: write_pos | read_pos | total_data_bytes]
-[Data Region: Slot₀ → Slot₁ → Slot₂ → ...]
-
-Each Slot:
-  next_pos (8 bytes)
-  metadata_size (4 bytes)  
-  payload_size (8 bytes)
-  metadata_json (up to 1024 bytes)
-  payload (variable size)
+```bash
+python -c 'from ipc0cp import StdioProducer; p=StdioProducer(); p.push({"k": "v"}); p.close()' \
+  | python -c 'from ipc0cp import StdioConsumer; c=StdioConsumer(); print(c.pop())'
 ```
 
-## Project Structure
+## C++ API
 
-```
-ipc0cp/
-├── python/
-│   └── ipc0cp/              # Python package
-│       ├── __init__.py      # Package initialization
-│       ├── ring_buffer.py   # Lock-free ring buffer implementation
-│       └ tests/           # Test suite
-│         └── test_ring_buffer.py
-├── cpp/
-│   └── ipc0cp/              # C++ library (future)
-│       ├── ipc.hpp          # C++ header files
-│       └── ipc.cpp          # C++ implementation
-├── CMakeLists.txt           # CMake build configuration
-├── pyproject.toml           # Python project configuration
-├── README.md                # This file
-└── LICENSE                  # Apache 2.0 License
+The C++ library provides the same transport concepts and object model.
+
+Consumer example (SHM):
+
+```cpp
+#include "ipc0cp/ring_buffer.hpp"
+#include <chrono>
+
+int main() {
+  ipc0cp::SharedRingBufferConsumer consumer("my_buffer", 256ULL * 1024 * 1024);
+
+  while (true) {
+    auto obj = consumer.pop(std::chrono::milliseconds(5000));
+    if (!obj) break; // EOS
+    // obj->data is a polymorphic ipc0cp::SerializableObject
+  }
+}
 ```
 
 ## Installation
 
-### Python Package
-
-```bash
-# Install with dependencies
-pip install -e .
-
-# Or install with dev dependencies (for testing)
-pip install -e ".[dev]"
-```
-
-### Dependencies
-
-- **Python 3.8+**
-- **NumPy** >= 1.20.0 - For array operations
-- **Pillow** >= 9.0.0 - For image handling
-- **pytest** >= 7.0.0 (dev) - For testing
-
-## Testing
-
-Run the test suite:
-
-```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run all tests
-pytest python/ipc0cp/tests/
-
-# Run with coverage
-pytest python/ipc0cp/tests/ --cov=ipc0cp --cov-report=html
-
-# Run specific test class
-pytest python/ipc0cp/tests/test_ring_buffer.py::TestSharedRingBufferGenericObjects -v
-```
-
-## Logging
-
-Both Python and C++ implementations include optional logging for debugging:
-
 ### Python
 
-```python
-import ipc0cp
-
-# Enable INFO level logging to stderr
-ipc0cp.enable_logging()
-
-# Set specific log level
-ipc0cp.set_log_level('DEBUG')  # DEBUG, INFO, WARNING, ERROR, CRITICAL
-
-# Disable logging
-ipc0cp.disable_logging()
+```bash
+pip install -e .
+pip install -e ".[dev]"
 ```
 
-### C++
+### C++ (library + tests)
 
-```cpp
-#include "ipc0cp/logger.hpp"
-
-// Enable logging to stderr
-ipc0cp::enable_logging();
-
-// Disable logging  
-ipc0cp::disable_logging();
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+cmake --build build -j
+ctest --test-dir build
 ```
 
-**Note**: Logging is **disabled by default** to avoid polluting stdout/stderr in production use.
+## Examples and tests
 
-## Examples
-
-See the `examples/` directory for complete working examples:
+Python example scripts live in `python/tests/`:
 
 ```bash
 # Terminal 1
-python examples/consumer_example.py
+python python/tests/consumer_example.py -s example_buffer --buffer-size 100
 
-# Terminal 2  
-python examples/producer_example.py
+# Terminal 2
+python python/tests/producer_example.py -s example_buffer -n 100 --buffer-size 100
 ```
 
-## Performance
+## Benchmarks
 
-The lock-free design achieves high throughput:
-- **~1000+ objects/second** for mixed workloads
-- **Sub-millisecond latency** for small objects
-- **Efficient memory usage** with variable-size slots
-- **No data copying** within shared memory region
+The benchmark harness compares shared memory (SHM, “0CP”) vs STDIO baseline.
+See `benchmarks/README.md` for the full methodology and the different variants.
+
+```bash
+python benchmarks/run_benchmark.py --duration 10
+```
+
+Example results (3 runs × 10s; payloads 512KB–5MB; payload-throughput only) from [benchmarks/benchmark_results_251226-235421.json](benchmarks/benchmark_results_251226-235421.json):
+Benchmark results (3 runs; 30.0s; payloads 512KB–5MB; payload-throughput only):
+
+| Variant | Producer mean (MB/s) | Consumer mean (MB/s) | Speedup |
+|---|---:|---:|---:|
+| Python STDIO (raw framing) | 342.45 | 342.38 | — |
+| Python STDIO (API framing) | 339.90 | 339.86 | — |
+| Python Shared Memory (SHM) | 497.20 | 502.49 | 1.48× |
+| C++ STDIO (API framing) | 677.26 | 677.26 | — |
+| C++ Shared Memory (SHM) | 2312.92 | 2299.72 | 3.40× |
+| Python → C++ STDIO (API) | 329.39 | 311.55 | — |
+| Python → C++ Shared Memory (SHM) | 351.53 | 464.10 | 1.49× |
+
+Global speedups (consumer throughput): SHM vs STDIO (raw) **1.47×**, SHM vs STDIO (API) **1.48×**.
+
+## Logging
+
+```python
+import ipc0cp
+ipc0cp.enable_logging()
+ipc0cp.set_log_level("INFO")
+```
 
 ## License
 
