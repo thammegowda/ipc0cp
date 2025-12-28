@@ -17,12 +17,21 @@ It ships two transports:
 - **SPSC lock-free design**: single producer + single consumer.
 - **Variable-size slots**: payload sizes can vary per message.
 - **Unified wire format**: both transports use JSON metadata + binary payload framing.
-- **Generic object support**: bytes, UTF-8 text, JSON, NumPy arrays, PIL images.
+- **Generic object support**: bytes, UTF-8 text, JSON, NumPy arrays, PIL images, and heterogeneous lists via the `ListData` format (bytes, text, JSON, arrays, nested lists, etc.).
 - **EOS marker**: producers can signal a clean end-of-stream.
 - **Blocking / non-blocking**: optional timeouts for push/pop.
 - **Data integrity checks**: sentinel bytes around payloads detect corruption/overruns.
 
 For a deeper dive into the memory layout, see `ARCHITECTURE.md`.
+
+## List payloads & custom serializers
+
+- **List payloads**: Pushing a Python `list` (or building a C++ `ListData`) creates a `metadata` entry like `{"type": "list", "version": "1.0", "count": 3, "items": [ ... ]}`. Each child `items` record keeps the nested metadata plus a `payload_size`, while the slot payload is the concatenation of each serialized payload. Lists support mixed payloads (bytes, text, JSON, numpy, nested lists) but are capped at 10 items and 10 levels deep to keep buffer traversal predictable. Deserialization unpacks them back into native objects automatically, so consumers see a `list` of bytes/dicts/str/... just like the sender pushed.
+- **Custom serializers**: Once registered, the `TypeRegistry` dispatches both directions.
+  - Python: import `ipc0cp.type_registry.register_type` and provide a callable `(metadata: Dict[str, str], payload: bytes) -> SerializableObject`. The registry is used whenever metadata carries the matching `type` (and optional `version`).
+  - C++: call `ipc0cp::TypeRegistry::instance().register_type("MyType", my_deserializer, "1.0")` where `my_deserializer` accepts the metadata map and payload bytes. The registry is seeded with the built-in handlers for `bytes`, `text`, `json`, `image`, `ndarray`, and `list`, so you can override or extend without breaking the wire format.
+
+Unknown types simply log a warning and fall back to raw `BytesData`, ensuring the consumer never blocks even if a newer producer introduces an unrecognized type.
 
 ## Python API
 
@@ -180,3 +189,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Acknowledgments
 
 This project aims to provide a simple yet efficient solution for inter-process communication between Python and C++ applications.
+
+## Future Work
+
+- Evaluate integrating https://github.com/google/flatbuffers/ to add schema-driven, zero-copy serialization alongside the existing metadata-driven payloads.

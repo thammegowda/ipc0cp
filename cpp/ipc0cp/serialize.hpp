@@ -21,6 +21,7 @@ enum class ObjectType {
     Text,
     Json,
     Bytes,
+    List,
     Unknown
 };
 
@@ -223,6 +224,79 @@ public:
     
     // Static factory for deserialization
     static std::unique_ptr<NumpyArray> deserialize(
+        const std::map<std::string, std::string>& metadata,
+        const std::vector<uint8_t>& payload
+    );
+};
+
+/**
+ * @brief List of serializable objects - supports mixed types
+ * 
+ * Serializes a list of objects with individual metadata for each item.
+ * Enables collections like [image, text, image] or [array1, array2].
+ * 
+ * Metadata:
+ *   {
+ *     "type": "list",
+ *     "version": "1.0",
+ *     "count": 3,
+ *     "items": [
+ *       {
+ *         "metadata": {"type": "image", ...},
+ *         "payload_size": 12345
+ *       },
+ *       { ... }
+ *     ]
+ *   }
+ * 
+ * Payload format: concatenated item payloads (metadata lives entirely in the slot metadata)
+ * 
+ * Constraints:
+ * - Minimum 1 item (empty lists not supported)
+ * - Maximum 10 items and 10 nesting depth
+ * - Items can be any serializable type (including nested lists)
+ */
+class ListData : public SerializableObject {
+public:
+    std::vector<std::unique_ptr<SerializableObject>> items;
+    static constexpr size_t MAX_ITEMS = 10;
+    static constexpr size_t MAX_DEPTH = 10;
+    
+    ListData() = default;
+    
+    /**
+     * @brief Create from vector of items
+     * @param items Vector of serializable objects
+     * @throws std::invalid_argument if empty or exceeds max depth
+     */
+    explicit ListData(std::vector<std::unique_ptr<SerializableObject>> items);
+    
+    ObjectType get_type() const override { return ObjectType::List; }
+    
+    SerializedData serialize() const override;
+    
+    /**
+     * @brief Get item count
+     */
+    size_t size() const { return items.size(); }
+    
+    /**
+     * @brief Check if list is empty
+     */
+    bool empty() const { return items.empty(); }
+    
+    /**
+     * @brief Get item at index
+     */
+    const SerializableObject* at(size_t index) const;
+    
+    /**
+     * @brief Get item at index (mutable)
+     */
+    SerializableObject* at_mut(size_t index);
+    
+    // Static factory for deserialization
+    static std::unique_ptr<ListData> deserialize(
         const std::map<std::string, std::string>& metadata,
         const std::vector<uint8_t>& payload
     );

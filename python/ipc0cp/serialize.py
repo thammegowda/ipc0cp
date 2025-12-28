@@ -11,10 +11,11 @@ Provides serializable object classes matching C++ hierarchy:
 """
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from enum import Enum
 from io import BytesIO
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional
 
 try:
     import numpy as np
@@ -30,9 +31,12 @@ except ImportError:
     HAS_PIL = False
     Image = None
 
+from .type_registry import get_deserializer
+
 
 # Constants
 MAX_METADATA_SIZE = 1024
+logger = logging.getLogger(__name__)
 
 
 class ObjectType(Enum):
@@ -42,6 +46,7 @@ class ObjectType(Enum):
     TEXT = "text"
     JSON = "json"
     BYTES = "bytes"
+    LIST = "list"
     UNKNOWN = "unknown"
 
 
@@ -308,6 +313,97 @@ class NumpyArray(BytesData):
         return np_obj
 
 
+class ListData(SerializableObject):
+    """Collection of heterogeneous serializable objects."""
+
+    MAX_ITEMS = 10
+    MAX_DEPTH = 10
+
+    def __init__(self, items: List[SerializableObject]):
+        if not items:
+            raise ValueError("ListData cannot be empty")
+        if len(items) > self.MAX_ITEMS:
+            raise ValueError("ListData exceeds maximum items")
+        self._items = items
+        if self._depth() > self.MAX_DEPTH:
+            raise ValueError("ListData exceeds maximum depth")
+
+    @property
+    def items(self) -> List[SerializableObject]:
+        return self._items
+
+    def _depth(self) -> int:
+        max_child = 0
+        for item in self._items:
+            if isinstance(item, ListData):
+                max_child = max(max_child, item._depth())
+        return 1 + max_child
+
+    def get_type(self) -> ObjectType:
+        return ObjectType.LIST
+
+    def serialize(self) -> Tuple[str, bytes]:
+        metadata = {
+            "type": self.get_type().value,
+            "version": "1.0",
+            "count": len(self._items)
+        }
+
+        item_entries: List[Dict[str, Any]] = []
+        payload_bytes = bytearray()
+
+        for item in self._items:
+            item_meta_json, item_payload = item.serialize()
+            item_entries.append({
+                "metadata": json.loads(item_meta_json),
+                "payload_size": len(item_payload)
+            })
+            payload_bytes.extend(item_payload)
+
+        metadata["items"] = item_entries
+        return json.dumps(metadata), bytes(payload_bytes)
+
+    @staticmethod
+    def deserialize(metadata: Dict[str, Any], payload: bytes) -> 'ListData':
+        count = metadata.get("count")
+        if not isinstance(count, int) or count <= 0 or count > ListData.MAX_ITEMS:
+            raise ValueError("Invalid list count")
+
+        items_meta = metadata.get("items")
+        if not isinstance(items_meta, list) or len(items_meta) != count:
+            raise ValueError("Invalid list metadata")
+
+        items: List[SerializableObject] = []
+        offset = 0
+
+        for idx, entry in enumerate(items_meta):
+            if not isinstance(entry, dict):
+                raise ValueError(f"ListData entry {idx} must be an object")
+
+            payload_size = entry.get("payload_size")
+            if not isinstance(payload_size, int):
+                raise ValueError(f"ListData entry {idx} payload_size invalid")
+
+            if offset + payload_size > len(payload):
+                raise ValueError(f"ListData entry {idx} payload truncated")
+
+            payload_slice = payload[offset:offset + payload_size]
+            offset += payload_size
+
+            metadata_entry = entry.get("metadata")
+            if not isinstance(metadata_entry, dict):
+                raise ValueError(f"ListData entry {idx} metadata invalid")
+
+            nested_meta_json = json.dumps(metadata_entry)
+            item = deserialize(nested_meta_json, payload_slice)
+            items.append(item)
+
+        if offset != len(payload):
+            raise ValueError("ListData payload length mismatch")
+
+        return ListData(items)
+
+
 # Global deserializer function
 def deserialize(metadata_json: str, payload: bytes) -> SerializableObject:
     """
@@ -329,23 +425,49 @@ def deserialize(metadata_json: str, payload: bytes) -> SerializableObject:
     
     metadata = json.loads(metadata_json)
     obj_type = metadata.get('type', 'unknown')
-    
-    # Dispatch to appropriate deserializer
-    if obj_type == ObjectType.NUMPY_ARRAY.value or obj_type == 'ndarray':
+    version = metadata.get('version', '')
+
+    custom_deserializer = get_deserializer(obj_type, version)
+    if custom_deserializer:
+        return custom_deserializer(metadata, payload)
+
+    if obj_type == ObjectType.LIST.value:
+        return ListData.deserialize(metadata, payload)
+    if obj_type in {ObjectType.NUMPY_ARRAY.value, 'ndarray'}:
         return NumpyArray.deserialize(metadata, payload)
-    elif obj_type == ObjectType.IMAGE.value or obj_type == 'image':
+    if obj_type in {ObjectType.IMAGE.value, 'image'}:
         return ImageData.deserialize(metadata, payload)
-    elif obj_type == ObjectType.TEXT.value or obj_type == 'text':
+    if obj_type in {ObjectType.TEXT.value, 'text'}:
         return TextData.deserialize(metadata, payload)
-    elif obj_type == ObjectType.JSON.value or obj_type == 'json':
+    if obj_type in {ObjectType.JSON.value, 'json'}:
         return JsonData.deserialize(metadata, payload)
-    elif obj_type == ObjectType.BYTES.value or obj_type == 'bytes':
+    if obj_type in {ObjectType.BYTES.value, 'bytes'}:
         return BytesData.deserialize(metadata, payload)
-    else:
-        raise ValueError(f"Unsupported object type: {obj_type}")
+
+    logger.warning("Unknown object type '%s' version '%s'; falling back to BytesData", obj_type, version)
+    return BytesData(payload)
 
 
 # Helper functions for high-level API
+def _to_serializable(obj: Any, depth: int = 0) -> SerializableObject:
+    if isinstance(obj, SerializableObject):
+        return obj
+    if HAS_NUMPY and isinstance(obj, np.ndarray):
+        return NumpyArray(obj)
+    if HAS_PIL and isinstance(obj, Image.Image):
+        return ImageData(obj)
+    if isinstance(obj, str):
+        return TextData(obj)
+    if isinstance(obj, bytes):
+        return BytesData(obj)
+    if isinstance(obj, (dict, int, float, bool, type(None))):
+        return JsonData(obj)
+    if isinstance(obj, (list, tuple)):
+        if depth >= ListData.MAX_DEPTH:
+            raise ValueError("ListData exceeds maximum depth")
+        return ListData([_to_serializable(item, depth + 1) for item in obj])
+    raise ValueError(f"No serializer found for type: {type(obj)}")
+
 def serialize_object(obj: Any) -> Tuple[str, bytes]:
     """
     Serialize a Python object to metadata JSON and payload.
@@ -356,65 +478,31 @@ def serialize_object(obj: Any) -> Tuple[str, bytes]:
     Returns:
         Tuple of (metadata_json, payload_bytes)
     """
-    if HAS_NUMPY and isinstance(obj, np.ndarray):
-        np_obj = NumpyArray(obj)
-        return np_obj.serialize()
-    elif HAS_PIL and isinstance(obj, Image.Image):
-        img_obj = ImageData(obj)
-        return img_obj.serialize()
-    elif isinstance(obj, str):
-        text_obj = TextData(obj)
-        return text_obj.serialize()
-    elif isinstance(obj, bytes):
-        bytes_obj = BytesData(obj)
-        return bytes_obj.serialize()
-    elif isinstance(obj, (dict, list, int, float, bool, type(None))):
-        json_obj = JsonData(obj)
-        return json_obj.serialize()
-    else:
-        raise ValueError(f"No serializer found for type: {type(obj)}")
+    serializable = _to_serializable(obj)
+    return serializable.serialize()
 
 
 def deserialize_object(metadata_json: str, payload: bytes) -> Any:
     """Deserialize from metadata JSON and payload."""
     obj = deserialize(metadata_json, payload)
 
-    # Convert to native Python types
+    return _to_native(obj)
+
+
+def _to_native(obj: SerializableObject) -> Any:
+    """Convert SerializableObject back to a native Python value."""
+    if isinstance(obj, ListData):
+        return [_to_native(item) for item in obj.items]
     if isinstance(obj, NumpyArray):
         return obj.to_array()
-    elif isinstance(obj, ImageData):
+    if isinstance(obj, ImageData):
         return obj.to_image()
-    elif isinstance(obj, JsonData):
+    if isinstance(obj, JsonData):
         return obj.json()
-    elif isinstance(obj, TextData):
+    if isinstance(obj, TextData):
         return obj.text
-    elif isinstance(obj, BytesData):
+    if isinstance(obj, BytesData):
         return obj.bytes
-    else:
-        return obj
+    return obj
 
 
-# Backward compatibility - old serializer classes
-SERIALIZERS = {
-    'ndarray': NumpyArray,
-    'image': ImageData,
-    'text': TextData,
-    'json': JsonData,
-    'bytes': BytesData,
-}
-
-
-def get_serializer(obj: Any):
-    """Get appropriate serializer class for an object (backward compatibility)"""
-    if HAS_NUMPY and isinstance(obj, np.ndarray):
-        return NumpyArray
-    elif HAS_PIL and isinstance(obj, Image.Image):
-        return ImageData
-    elif isinstance(obj, str):
-        return TextData
-    elif isinstance(obj, bytes):
-        return BytesData
-    elif isinstance(obj, (dict, list, int, float, bool, type(None))):
-        return JsonData
-    else:
-        raise ValueError(f"No serializer found for type: {type(obj)}")

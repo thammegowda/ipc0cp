@@ -172,6 +172,28 @@ class TestSharedRingBufferGenericObjects:
             consumer.close()
             producer.close()
             producer.unlink()
+
+    def test_list_payload_bytes_json_text(self):
+        """Test pushing a list containing bytes, JSON, and text."""
+        shm_name = "test_list_payload"
+
+        producer = SharedRingBufferProducer(shm_name=shm_name)
+        consumer = SharedRingBufferConsumer(shm_name=shm_name)
+
+        try:
+            payload = [b"raw bytes", {"name": "list", "flag": True}, "plain text"]
+            assert producer.push(payload)
+
+            retrieved = consumer.pop()
+            assert isinstance(retrieved, list)
+            assert retrieved == payload
+            assert isinstance(retrieved[0], bytes)
+            assert isinstance(retrieved[1], dict)
+            assert isinstance(retrieved[2], str)
+        finally:
+            consumer.close()
+            producer.close()
+            producer.unlink()
     
     def test_metadata_size_limit(self):
         """Test that metadata respects the 1024 byte limit."""

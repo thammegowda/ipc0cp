@@ -37,6 +37,7 @@ FetchContent_MakeAvailable(googletest)
 # Library sources
 set(IPC0CP_SOURCES
     cpp/ipc0cp/serialize.cpp
+    cpp/ipc0cp/type_registry.cpp
     cpp/ipc0cp/ring_buffer.cpp
     cpp/ipc0cp/stdio.cpp
 )
@@ -44,6 +45,7 @@ set(IPC0CP_SOURCES
 set(IPC0CP_HEADERS
     cpp/ipc0cp/ipc.hpp
     cpp/ipc0cp/serialize.hpp
+    cpp/ipc0cp/type_registry.hpp
     cpp/ipc0cp/ring_buffer.hpp
     cpp/ipc0cp/stdio.hpp
 )

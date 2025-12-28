@@ -357,3 +357,30 @@ Metadata: {"type": "bytes", "size": 1024}
 Payload:  [arbitrary binary data]
 Size:     1024 bytes
 ```
+
+### List Payload Format
+```json
+Metadata: {
+    "type": "list",
+    "version": "1.0",
+    "count": 3,
+    "items": [
+        {"metadata": {"type": "bytes", "size": 4}, "payload_size": 4},
+        {"metadata": {"type": "json", "encoding": "utf-8"}, "payload_size": 27},
+        {"metadata": {"type": "text", "encoding": "utf-8"}, "payload_size": 9}
+    ]
+}
+Payload: [bytes_of_child0][bytes_of_child1][bytes_of_child2]
+```
+
+- Payloads are concatenated; the per-item metadata only tracks the size so the reader can slice the shared buffer correctly.
+- Lists **cannot be empty** and are limited to **10 items / 10 levels deep** to keep stack recursion and slot metadata predictable.
+- Nested lists simply embed their own metadata in the parent `items` entry, so the deserializer walks depth-first and reconstructs a native Python list or a C++ `ListData` tree.
+
+### Extensibility via `TypeRegistry`
+
+Both Python and C++ expose a singleton `TypeRegistry` that maps `(type, version)` keys to deserializer callbacks.
+
+- **Registration**: Callers register their custom deserializers before consuming data. In Python use `ipc0cp.type_registry.register_type("MyType", my_deserializer, version="1.0")`; in C++ call `ipc0cp::TypeRegistry::instance().register_type("MyType", my_deserializer, "1.0")`.
+- **Builtin handlers**: The registry is seeded with `bytes`, `text`, `json`, `image`, `ndarray`, and `list`, so consumers never need to mutate core parsing logic.
+- **Lookup flow**: When deserializing, the registry tries `(type, version)` first, then `(type, "")`, logging a warning and falling back to `BytesData` if nothing matches. This lets producers add new types safely without breaking older consumers.

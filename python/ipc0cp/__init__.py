@@ -32,8 +32,6 @@ from .serialize import (
     serialize_object,
     deserialize_object,
     deserialize,
-    SERIALIZERS,
-    get_serializer,
 )
 from .logger import (
     set_log_level,
@@ -61,8 +59,6 @@ __all__ = [
     "serialize_object",
     "deserialize_object",
     "deserialize",
-    "SERIALIZERS",
-    "get_serializer",
     "set_log_level",
     "enable_logging",
     "disable_logging",

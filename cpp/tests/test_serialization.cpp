@@ -5,6 +5,18 @@
 
 using namespace ipc0cp;
 
+static std::map<std::string, std::string> parse_metadata(const std::string& json_str) {
+    auto parsed_json = nlohmann::json::parse(json_str);
+    std::map<std::string, std::string> metadata;
+    for (auto& [key, value] : parsed_json.items()) {
+        metadata[key] = value.dump();
+        if (!metadata[key].empty() && metadata[key].front() == '"' && metadata[key].back() == '"') {
+            metadata[key] = metadata[key].substr(1, metadata[key].size() - 2);
+        }
+    }
+    return metadata;
+}
+
 class SerializationTest : public ::testing::Test {
 protected:
     void SetUp() override {}
@@ -200,6 +212,40 @@ TEST_F(SerializationTest, PolymorphicDeserialization) {
     auto* text_ptr = dynamic_cast<TextData*>(obj.get());
     ASSERT_NE(text_ptr, nullptr);
     EXPECT_EQ(text_ptr->text, "Test message");
+}
+
+TEST_F(SerializationTest, ListDataMixedPayloads) {
+    std::vector<std::unique_ptr<SerializableObject>> items;
+    items.push_back(std::make_unique<BytesData>(std::vector<uint8_t>{0xDE, 0xAD, 0xBE, 0xEF}));
+    items.push_back(std::make_unique<JsonData>(R"({"name":"list","value":123})"));
+    items.push_back(std::make_unique<TextData>("list text"));
+
+    ListData list(std::move(items));
+
+    auto serialized = list.serialize();
+    EXPECT_EQ(list.size(), 3u);
+
+    auto metadata = parse_metadata(serialized.metadata_json);
+    auto deserialized = ListData::deserialize(metadata, serialized.payload);
+    ASSERT_NE(deserialized, nullptr);
+    EXPECT_EQ(deserialized->size(), 3u);
+
+    const auto& deserialized_items = deserialized->items;
+    ASSERT_EQ(deserialized_items.size(), 3u);
+
+    auto* bytes_item = dynamic_cast<BytesData*>(deserialized_items[0].get());
+    ASSERT_NE(bytes_item, nullptr);
+    EXPECT_EQ(bytes_item->bytes, std::vector<uint8_t>({0xDE, 0xAD, 0xBE, 0xEF}));
+
+    auto* json_item = dynamic_cast<JsonData*>(deserialized_items[1].get());
+    ASSERT_NE(json_item, nullptr);
+    auto parsed = json_item->json();
+    EXPECT_EQ(parsed["name"], "list");
+    EXPECT_EQ(parsed["value"], 123);
+
+    auto* text_item = dynamic_cast<TextData*>(deserialized_items[2].get());
+    ASSERT_NE(text_item, nullptr);
+    EXPECT_EQ(text_item->text, "list text");
 }
 
 int main(int argc, char** argv) {

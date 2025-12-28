@@ -1,14 +1,18 @@
+// c++ standard includes
+// c++ standard includes
 #include "serialize.hpp"
 #include "logger.hpp"
+#include "type_registry.hpp"
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <stdexcept>
 #include <nlohmann/json.hpp>
 
-using json = nlohmann::json;
-
 namespace ipc0cp {
+
+using json = nlohmann::json;
 
 ObjectType stringToObjectType(const std::string& type_str) {
     static const std::map<std::string, ObjectType> type_map = {
@@ -16,7 +20,8 @@ ObjectType stringToObjectType(const std::string& type_str) {
         {"image", ObjectType::Image},
         {"text", ObjectType::Text},
         {"json", ObjectType::Json},
-        {"bytes", ObjectType::Bytes}
+        {"bytes", ObjectType::Bytes},
+        {"list", ObjectType::List}
     };
     
     auto it = type_map.find(type_str);
@@ -30,9 +35,40 @@ std::string objectTypeToString(ObjectType type) {
         case ObjectType::Text: return "text";
         case ObjectType::Json: return "json";
         case ObjectType::Bytes: return "bytes";
+        case ObjectType::List: return "list";
         default: return "unknown";
     }
 }
+
+namespace {
+
+bool register_builtin_types() {
+    static const bool initialized = [] {
+        auto& registry = TypeRegistry::instance();
+        registry.register_type("bytes", [](const auto& metadata, const auto& payload) {
+            return BytesData::deserialize(metadata, payload);
+        });
+        registry.register_type("text", [](const auto& metadata, const auto& payload) {
+            return TextData::deserialize(metadata, payload);
+        });
+        registry.register_type("json", [](const auto& metadata, const auto& payload) {
+            return JsonData::deserialize(metadata, payload);
+        });
+        registry.register_type("image", [](const auto& metadata, const auto& payload) {
+            return ImageData::deserialize(metadata, payload);
+        });
+        registry.register_type("ndarray", [](const auto& metadata, const auto& payload) {
+            return NumpyArray::deserialize(metadata, payload);
+        });
+        registry.register_type("list", [](const auto& metadata, const auto& payload) {
+            return ListData::deserialize(metadata, payload);
+        });
+        return true;
+    }();
+    return initialized;
+}
+
+} // namespace
 
 // ==================== SerializerUtils Helper Functions ====================
 
@@ -90,27 +126,39 @@ std::unique_ptr<SerializableObject> SerializableObject::deserialize(
     const std::map<std::string, std::string>& metadata,
     const std::vector<uint8_t>& payload
 ) {
+    register_builtin_types();
+
     auto type_it = metadata.find("type");
     if (type_it == metadata.end()) {
         return nullptr;
     }
-    
-    ObjectType obj_type = stringToObjectType(type_it->second);
-    
-    switch (obj_type) {
-        case ObjectType::NumpyArray:
-            return NumpyArray::deserialize(metadata, payload);
-        case ObjectType::Image:
-            return ImageData::deserialize(metadata, payload);
-        case ObjectType::Text:
-            return TextData::deserialize(metadata, payload);
-        case ObjectType::Json:
-            return JsonData::deserialize(metadata, payload);
-        case ObjectType::Bytes:
-            return BytesData::deserialize(metadata, payload);
-        default:
-            return nullptr;
+
+    const std::string& type_name = type_it->second;
+    const auto version_it = metadata.find("version");
+    const std::string version = version_it != metadata.end() ? version_it->second : "";
+
+    auto& registry = TypeRegistry::instance();
+    CustomDeserializer deserializer;
+    if (!version.empty()) {
+        deserializer = registry.get_deserializer(type_name, version);
     }
+    if (!deserializer) {
+        deserializer = registry.get_deserializer(type_name);
+    }
+
+    if (deserializer) {
+        return deserializer(metadata, payload);
+    }
+
+    if (version.empty()) {
+        IPC_LOG_WARNING("Unknown serialized type '" << type_name << "' - falling back to BytesData");
+    } else {
+        IPC_LOG_WARNING(
+            "Unknown serialized type '" << type_name << "'@'" << version << "' - falling back to BytesData"
+        );
+    }
+
+    return BytesData::deserialize(metadata, payload);
 }
 
 // ==================== BytesData ====================
@@ -314,6 +362,181 @@ SerializedData NumpyArray::serialize() const {
     result.payload = bytes;  // bytes contains array data
     
     return result;
+}
+
+// ==================== ListData ====================
+
+namespace {
+
+size_t compute_list_depth(const ListData* list);
+
+size_t compute_list_depth(const ListData* list) {
+    size_t max_child_depth = 0;
+    for (const auto& child : list->items) {
+        if (const ListData* nested = dynamic_cast<const ListData*>(child.get())) {
+            max_child_depth = std::max(max_child_depth, compute_list_depth(nested));
+        }
+    }
+    return 1 + max_child_depth;
+}
+
+}
+
+ListData::ListData(std::vector<std::unique_ptr<SerializableObject>> items_in)
+    : items(std::move(items_in)) {
+    if (items.empty()) {
+        throw std::invalid_argument("ListData cannot be empty");
+    }
+    if (items.size() > MAX_ITEMS) {
+        throw std::invalid_argument("ListData exceeds maximum items (" + std::to_string(MAX_ITEMS) + ")");
+    }
+    if (compute_list_depth(this) > MAX_DEPTH) {
+        throw std::invalid_argument("ListData exceeds maximum nesting depth (" + std::to_string(MAX_DEPTH) + ")");
+    }
+}
+
+const SerializableObject* ListData::at(size_t index) const {
+    if (index >= items.size()) {
+        return nullptr;
+    }
+    return items[index].get();
+}
+
+SerializableObject* ListData::at_mut(size_t index) {
+    if (index >= items.size()) {
+        return nullptr;
+    }
+    return items[index].get();
+}
+
+SerializedData ListData::serialize() const {
+    SerializedData result;
+
+    json metadata;
+    metadata["type"] = "list";
+    metadata["version"] = "1.0";
+    metadata["count"] = items.size();
+
+    json item_array = json::array();
+    std::vector<uint8_t> concatenated_payload;
+    concatenated_payload.reserve(1024);
+
+    for (const auto& item : items) {
+        if (!item) {
+            throw std::runtime_error("Null item in ListData");
+        }
+
+        auto item_data = item->serialize();
+        json item_entry;
+        item_entry["metadata"] = json::parse(item_data.metadata_json);
+        item_entry["payload_size"] = item_data.payload.size();
+        item_array.push_back(item_entry);
+
+        concatenated_payload.insert(
+            concatenated_payload.end(),
+            item_data.payload.begin(),
+            item_data.payload.end()
+        );
+    }
+
+    metadata["items"] = item_array;
+    result.metadata_json = metadata.dump();
+    result.payload = std::move(concatenated_payload);
+
+    return result;
+}
+
+std::unique_ptr<ListData> ListData::deserialize(
+    const std::map<std::string, std::string>& metadata,
+    const std::vector<uint8_t>& payload
+) {
+    auto count_it = metadata.find("count");
+    if (count_it == metadata.end()) {
+        IPC_LOG_ERROR("ListData missing count");
+        return nullptr;
+    }
+
+    size_t count = 0;
+    try {
+        count = std::stoull(count_it->second);
+    } catch (...) {
+        IPC_LOG_ERROR("ListData invalid count: " << count_it->second);
+        return nullptr;
+    }
+
+    if (count == 0 || count > MAX_ITEMS) {
+        IPC_LOG_ERROR("ListData invalid count: " << count);
+        return nullptr;
+    }
+
+    auto items_it = metadata.find("items");
+    if (items_it == metadata.end()) {
+        IPC_LOG_ERROR("ListData missing items array");
+        return nullptr;
+    }
+
+    json items_json;
+    try {
+        items_json = json::parse(items_it->second);
+    } catch (const std::exception& e) {
+        IPC_LOG_ERROR("ListData items JSON parse failed: " << e.what());
+        return nullptr;
+    }
+
+    if (!items_json.is_array() || items_json.size() != count) {
+        IPC_LOG_ERROR("ListData items count mismatch");
+        return nullptr;
+    }
+
+    std::vector<std::unique_ptr<SerializableObject>> items_vec;
+    items_vec.reserve(count);
+    size_t offset = 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        const auto& entry = items_json[i];
+        if (!entry.is_object()) {
+            IPC_LOG_ERROR("ListData entry " << i << " is not an object");
+            return nullptr;
+        }
+
+        if (!entry.contains("payload_size") || !entry["payload_size"].is_number_unsigned()) {
+            IPC_LOG_ERROR("ListData entry " << i << " missing payload_size");
+            return nullptr;
+        }
+
+        auto payload_size = entry["payload_size"].get<size_t>();
+        if (offset + payload_size > payload.size()) {
+            IPC_LOG_ERROR("ListData item " << i << " incomplete payload");
+            return nullptr;
+        }
+
+        if (!entry.contains("metadata") || !entry["metadata"].is_object()) {
+            IPC_LOG_ERROR("ListData entry " << i << " missing metadata");
+            return nullptr;
+        }
+
+        std::string item_meta_json = entry["metadata"].dump();
+        std::vector<uint8_t> item_payload(
+            payload.begin() + offset,
+            payload.begin() + offset + payload_size
+        );
+        offset += payload_size;
+
+        auto item = ::ipc0cp::deserialize(item_meta_json, item_payload);
+        if (!item) {
+            IPC_LOG_ERROR("ListData item " << i << " deserialization failed");
+            return nullptr;
+        }
+
+        items_vec.push_back(std::move(item));
+    }
+
+    if (offset != payload.size()) {
+        IPC_LOG_ERROR("ListData payload has trailing bytes");
+        return nullptr;
+    }
+
+    return std::make_unique<ListData>(std::move(items_vec));
 }
 
 // Global deserialize function
