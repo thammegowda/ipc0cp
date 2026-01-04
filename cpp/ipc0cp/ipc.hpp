@@ -11,7 +11,11 @@
 #include <cstring>
 #include <endian.h>
 #include <map>
+#include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace ipc0cp {
 
@@ -126,5 +130,83 @@ inline void write_le32(void* ptr, uint32_t value) {
     uint32_t converted = htole32(value);
     std::memcpy(ptr, &converted, sizeof(converted));
 }
+
+/**
+ * @brief Abstract base class for IPC consumers
+ * Provides interface for receiving data from IPC transports (stdio, shared memory, etc.)
+ */
+class IPCConsumer {
+public:
+    virtual ~IPCConsumer() = default;
+    
+    /**
+     * @brief Pop an object from the IPC stream
+     * @param timeout_ms Timeout in milliseconds. Values < 0 block indefinitely.
+     * @return std::unique_ptr<IPCObject> with deserialized data on success,
+     *         or nullptr on end-of-stream. Throws IPCException on errors.
+     */
+    virtual std::unique_ptr<IPCObject> pop(int timeout_ms = -1) = 0;
+    
+    /**
+     * @brief Check if end-of-stream marker has been received
+     * @return true if EOS marker was received, false otherwise
+     */
+    virtual bool eos_received() const = 0;
+    
+    /**
+     * @brief Get the last error from the consumer
+     * @return IPCError code indicating the last error
+     */
+    virtual IPCError get_last_error() const { return IPCError::None; }
+
+    /**
+     * @brief Read raw metadata/payload pair
+     * @param timeout_ms Timeout in milliseconds (-1 = block indefinitely)
+     * @return metadata JSON and payload bytes, or nullopt on end-of-stream
+     */
+    virtual std::optional<std::pair<std::string, std::vector<uint8_t>>> pop_raw(
+        int timeout_ms = -1) = 0;
+};
+
+/**
+ * @brief Abstract base class for IPC producers
+ * Provides interface for sending data over IPC transports (stdio, shared memory, etc.)
+ */
+class IPCProducer {
+public:
+    virtual ~IPCProducer() = default;
+    
+    /**
+     * @brief Push an object to the IPC transport
+     * @param obj Object to serialize and send
+     * @param timeout_ms Timeout in milliseconds. Values < 0 block indefinitely.
+     * @throws IPCException on errors
+     */
+    virtual void push(const SerializableObject& obj, int timeout_ms = -1) = 0;
+
+    /**
+     * @brief Push raw metadata/payload data
+     * @param metadata_json JSON metadata string
+     * @param payload Binary payload
+     * @param timeout_ms Timeout in milliseconds (-1 = block indefinitely)
+     * @return true on success
+     */
+    virtual bool push_raw(
+        const std::string& metadata_json,
+        const std::vector<uint8_t>& payload,
+        int timeout_ms = -1) = 0;
+    
+    /**
+     * @brief Send end-of-stream marker and close the producer
+     * @throws IPCException on errors
+     */
+    virtual void close() = 0;
+    
+    /**
+     * @brief Get the last error from the producer
+     * @return IPCError code indicating the last error
+     */
+    virtual IPCError get_last_error() const { return IPCError::None; }
+};
 
 } // namespace ipc0cp

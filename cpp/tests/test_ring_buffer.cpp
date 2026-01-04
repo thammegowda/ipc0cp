@@ -35,11 +35,11 @@ TEST_F(RingBufferTest, BasicProducerConsumer) {
     
     // Push some text
     TextData text_obj("Hello from C++!");
-    ASSERT_TRUE(producer.push(text_obj));
+    producer.push(text_obj);
     
     // Pop and verify
-    auto obj = consumer.pop(std::chrono::milliseconds(1000));
-    ASSERT_TRUE(obj.has_value());
+    auto obj = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+    ASSERT_TRUE(obj);
     EXPECT_EQ(obj->get_type(), ObjectType::Text);
     
     auto& text = obj->as<TextData>();
@@ -58,22 +58,22 @@ TEST_F(RingBufferTest, MultipleObjects) {
     JsonData json_obj(R"({"key": "value"})");
     BytesData bytes({0x01, 0x02, 0x03});
     
-    ASSERT_TRUE(producer.push(text));
-    ASSERT_TRUE(producer.push(json_obj));
-    ASSERT_TRUE(producer.push(bytes));
+    producer.push(text);
+    producer.push(json_obj);
+    producer.push(bytes);
     
     // Pop and verify order
-    auto obj1 = consumer.pop(std::chrono::milliseconds(1000));
-    ASSERT_TRUE(obj1.has_value());
+    auto obj1 = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+    ASSERT_TRUE(obj1);
     EXPECT_EQ(obj1->get_type(), ObjectType::Text);
     EXPECT_EQ(obj1->as<TextData>().text, "Test text");
     
-    auto obj2 = consumer.pop(std::chrono::milliseconds(1000));
-    ASSERT_TRUE(obj2.has_value());
+    auto obj2 = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+    ASSERT_TRUE(obj2);
     EXPECT_EQ(obj2->get_type(), ObjectType::Json);
     
-    auto obj3 = consumer.pop(std::chrono::milliseconds(1000));
-    ASSERT_TRUE(obj3.has_value());
+    auto obj3 = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+    ASSERT_TRUE(obj3);
     EXPECT_EQ(obj3->get_type(), ObjectType::Bytes);
     EXPECT_EQ(obj3->as<BytesData>().bytes.size(), 3);
 }
@@ -96,10 +96,10 @@ TEST_F(RingBufferTest, NumpyArrayTransfer) {
         data[i] = static_cast<float>(i);
     }
     
-    ASSERT_TRUE(producer.push(arr));
+    producer.push(arr);
     
-    auto obj = consumer.pop(std::chrono::milliseconds(1000));
-    ASSERT_TRUE(obj.has_value());
+    auto obj = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+    ASSERT_TRUE(obj);
     EXPECT_EQ(obj->get_type(), ObjectType::NumpyArray);
     
     auto& arr_received = obj->as<NumpyArray>();
@@ -123,10 +123,10 @@ TEST_F(RingBufferTest, BufferWrapAround) {
     // Push and pop multiple times to wrap around
     for (int i = 0; i < 10; ++i) {
         TextData text("Message " + std::to_string(i));
-        ASSERT_TRUE(producer.push(text));
+        producer.push(text);
         
-        auto obj = consumer.pop(std::chrono::milliseconds(1000));
-        ASSERT_TRUE(obj.has_value());
+        auto obj = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+        ASSERT_TRUE(obj);
         EXPECT_EQ(obj->as<TextData>().text, "Message " + std::to_string(i));
     }
 }
@@ -140,7 +140,7 @@ TEST_F(RingBufferTest, EmptyBuffer) {
     
     // Try to pop from empty buffer with short timeout - should throw IPCException
     EXPECT_THROW({
-        consumer.pop(std::chrono::milliseconds(100));  // 100ms timeout
+        consumer.pop(static_cast<int>(std::chrono::milliseconds(100).count()));  // 100ms timeout
     }, IPCException);
 }
 
@@ -155,7 +155,9 @@ TEST_F(RingBufferTest, ConcurrentProducerConsumer) {
     std::thread producer_thread([&]() {
         for (int i = 0; i < num_messages; ++i) {
             TextData text("Message " + std::to_string(i));
-            while (!producer.push(text, 0)) {
+            try {
+                producer.push(text, static_cast<int>(std::chrono::milliseconds(0).count()));
+            } catch (...) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
@@ -167,8 +169,8 @@ TEST_F(RingBufferTest, ConcurrentProducerConsumer) {
         SharedRingBufferConsumer consumer(shm_name_, buffer_size);
         
         while (received_count < num_messages) {
-            auto obj = consumer.pop(std::chrono::milliseconds(100));
-            if (obj.has_value()) {
+            auto obj = consumer.pop(static_cast<int>(std::chrono::milliseconds(100).count()));
+            if (obj) {
                 EXPECT_EQ(obj->get_type(), ObjectType::Text);
                 received_count++;
             }
@@ -195,15 +197,15 @@ TEST_F(RingBufferTest, BufferStats) {
     
     // Push an object
     TextData text("Test message");
-    ASSERT_TRUE(producer.push(text));
+    producer.push(text);
     
     stats = consumer.get_stats();
     EXPECT_FALSE(stats.is_empty);
     EXPECT_GT(stats.used_bytes, 0);
     
     // Pop the object
-    auto obj = consumer.pop(std::chrono::milliseconds(1000));
-    ASSERT_TRUE(obj.has_value());
+    auto obj = consumer.pop(static_cast<int>(std::chrono::milliseconds(1000).count()));
+    ASSERT_TRUE(obj);
     
     stats = consumer.get_stats();
     EXPECT_TRUE(stats.is_empty);

@@ -52,7 +52,7 @@ namespace ipc0cp {
  * producer.close();  // Sends EOS marker
  * @endcode
  */
-class StdioProducer {
+class StdioProducer : public IPCProducer {
 public:
     /**
      * @brief Construct a STDIO producer
@@ -61,26 +61,30 @@ public:
     explicit StdioProducer(std::ostream* output = &std::cout);
     
     /**
-     * @brief Push a serializable object (high-level API)
+     * @brief Push a serializable object
      * @param obj SerializableObject to push
-     * @return true on success
+     * @param timeout_ms Ignored for STDIO (blocking only)
      * @throws IPCException if already closed or serialization fails
      */
-    bool push(const SerializableObject& obj);
+    void push(const SerializableObject& obj, 
+             int timeout_ms = -1) override;
     
     /**
      * @brief Write metadata and payload to stdout (low-level API)
      * @param metadata_json JSON metadata string
      * @param payload Binary payload data
-     * @return true on success
-     * @throws IPCException if already closed or write fails
+        * @param timeout_ms Ignored for STDIO (blocking only)
+        * @return true on success
+        * @throws IPCException if already closed or write fails
      */
-    bool push_raw(const std::string& metadata_json, const std::vector<uint8_t>& payload);
+        bool push_raw(const std::string& metadata_json,
+                      const std::vector<uint8_t>& payload,
+                      int timeout_ms = -1) override;
     
     /**
      * @brief Send end-of-stream marker (metadata_size=0, payload_size=0)
      */
-    void close();
+    void close() override;
     
     /**
      * @brief Check if producer is closed
@@ -115,7 +119,7 @@ private:
  * }
  * @endcode
  */
-class StdioConsumer {
+class StdioConsumer : public IPCConsumer {
 public:
     /**
      * @brief Construct a STDIO consumer
@@ -124,12 +128,13 @@ public:
     explicit StdioConsumer(std::istream* input = &std::cin);
     
     /**
-     * @brief Read and deserialize an object (high-level API)
+     * @brief Read and deserialize an object
      * @param timeout_ms Ignored for STDIO (blocking I/O only)
-     * @return Deserialized IPCObject, or nullopt if end-of-stream
+     * @return Deserialized IPCObject, or nullptr on end-of-stream
      * @throws IPCException on read errors or corruption
      */
-    std::optional<IPCObject> pop(int timeout_ms = -1);
+    std::unique_ptr<IPCObject> pop(
+        int timeout_ms = -1) override;
     
     /**
      * @brief Read metadata and payload from stdin (low-level API)
@@ -139,12 +144,12 @@ public:
      */
     std::optional<std::pair<std::string, std::vector<uint8_t>>> pop_raw(
         int timeout_ms = -1
-    );
+    ) override;
     
     /**
      * @brief Check if end-of-stream was received
      */
-    bool eos_received() const { return eos_received_; }
+    bool eos_received() const override { return eos_received_; }
 
 private:
     std::istream* input_;
