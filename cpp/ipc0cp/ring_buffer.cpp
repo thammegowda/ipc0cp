@@ -236,11 +236,10 @@ uint64_t SharedRingBufferConsumer::advance_pos(uint64_t pos, size_t delta) {
 }
 
 std::optional<std::map<std::string, std::string>> SharedRingBufferConsumer::parse_metadata(
-    const std::vector<uint8_t>& metadata_bytes
+    const std::string& metadata_json
 ) {
     try {
-        std::string json_str(metadata_bytes.begin(), metadata_bytes.end());
-        auto j = json::parse(json_str);
+        auto j = json::parse(metadata_json);
         
         std::map<std::string, std::string> metadata_map;
         
@@ -270,126 +269,118 @@ std::optional<std::map<std::string, std::string>> SharedRingBufferConsumer::pars
     }
 }
 
-std::optional<RingBufferObject> SharedRingBufferConsumer::pop(
-    std::optional<std::chrono::milliseconds> timeout
-) {
-    if (!shm_ptr_) {
-        throw RingBufferException(RingBufferError::NotInitialized);
+std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferConsumer::pop_raw(
+    int timeout_ms) {
+    std::optional<std::chrono::milliseconds> timeout;
+    if (timeout_ms >= 0) {
+        timeout = std::chrono::milliseconds(timeout_ms);
     }
-    
-    // Wait for data if blocking
+
+    if (!shm_ptr_) {
+        throw IPCException(IPCError::NotInitialized);
+    }
+
     auto start_time = std::chrono::steady_clock::now();
-    
     while (true) {
         uint64_t write_pos = get_write_pos();
         uint64_t read_pos = get_read_pos();
         
         if (write_pos != read_pos) {
-            break;  // Data available
+            break;
         }
         
         if (!blocking_) {
-            throw RingBufferException(RingBufferError::BufferEmpty);
+            throw IPCException(IPCError::BufferEmpty);
         }
         
         if (timeout.has_value()) {
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             if (elapsed >= *timeout) {
-                throw RingBufferException(RingBufferError::Timeout);
+                throw IPCException(IPCError::Timeout);
             }
         }
         
         std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
     
-    // Read slot at read_pos
     uint64_t read_pos = get_read_pos();
     uint64_t current_pos = read_pos;
     
-    // Read next_pos (8 bytes)
     uint64_t next_pos = read_uint64(current_pos);
     current_pos = advance_pos(current_pos, 8);
-    
-    // Read metadata_size (4 bytes)
+
     uint32_t metadata_size = read_uint32(current_pos);
     current_pos = advance_pos(current_pos, 4);
     
-    // Validate metadata size
     if (metadata_size > MAX_METADATA_SIZE) {
-        throw RingBufferException(RingBufferError::InvalidMetadata, 
-            "Invalid metadata_size: " + std::to_string(metadata_size) + " > " + std::to_string(MAX_METADATA_SIZE));
+        throw IPCException(IPCError::InvalidMetadata, 
+            "Invalid metadata_size: " + std::to_string(metadata_size));
     }
     
-    // Read payload_size (8 bytes)
     uint64_t payload_size = read_uint64(current_pos);
     current_pos = advance_pos(current_pos, 8);
     
-    // Check for end-of-stream marker (metadata_size == 0 && payload_size == 0)
     if (metadata_size == 0 && payload_size == 0) {
         eos_received_ = true;
-        IPC_LOG_INFO("Received end-of-stream marker");
-        // Update read_pos to consume the EOS slot
         set_read_pos(next_pos);
         
-        // Auto-cleanup: unlink shared memory when EOS received
         if (auto_unlink_) {
             close();
             unlink();
-            IPC_LOG_INFO("Auto-unlinked shared memory after EOS");
         }
         
         return std::nullopt;
     }
     
-    // Read metadata JSON
     auto metadata_bytes = read_bytes(current_pos, metadata_size);
     current_pos = advance_pos(current_pos, metadata_size);
     
-    // Parse metadata
-    auto metadata_result = parse_metadata(metadata_bytes);
-    if (!metadata_result) {
-        throw RingBufferException(RingBufferError::InvalidMetadata, "Failed to parse metadata JSON");
-    }
+    std::string metadata_json(metadata_bytes.begin(), metadata_bytes.end());
     
-    // Read and verify start sentinel
     auto start_sentinel = read_bytes(current_pos, 1);
     if (start_sentinel.empty() || start_sentinel[0] != SENTINEL_BYTE) {
-        last_error_ = RingBufferError::CorruptPayload;
-        throw RingBufferException(RingBufferError::CorruptPayload, 
-            "Invalid start sentinel (expected " + std::to_string(static_cast<int>(SENTINEL_BYTE)) + 
-            ", got " + (start_sentinel.empty() ? "empty" : std::to_string(start_sentinel[0])) + ")");
+        last_error_ = IPCError::CorruptPayload;
+        throw IPCException(IPCError::CorruptPayload, "Invalid start sentinel");
     }
     current_pos = advance_pos(current_pos, 1);
     
-    // Read payload
     auto payload = read_bytes(current_pos, payload_size);
     current_pos = advance_pos(current_pos, payload_size);
     
-    // Read and verify end sentinel
     auto end_sentinel = read_bytes(current_pos, 1);
     if (end_sentinel.empty() || end_sentinel[0] != SENTINEL_BYTE) {
-        last_error_ = RingBufferError::CorruptPayload;
-        throw RingBufferException(RingBufferError::CorruptPayload,
-            "Invalid end sentinel (expected " + std::to_string(static_cast<int>(SENTINEL_BYTE)) + 
-            ", got " + (end_sentinel.empty() ? "empty" : std::to_string(end_sentinel[0])) + ")");
+        last_error_ = IPCError::CorruptPayload;
+        throw IPCException(IPCError::CorruptPayload, "Invalid end sentinel");
     }
     
-    // Deserialize using the SerializableObject factory
-    auto deserialized = SerializableObject::deserialize(*metadata_result, payload);
-    
-    // Check if deserialization succeeded
-    if (!deserialized) {
-        throw RingBufferException(RingBufferError::DeserializationFailed);
-    }
-    
-    // Update read_pos
     set_read_pos(next_pos);
     
-    // Create and return RingBufferObject
-    RingBufferObject obj(std::move(deserialized));
-    obj.raw_metadata = std::move(*metadata_result);
-    
-    return obj;
+    return std::make_pair(std::move(metadata_json), std::move(payload));
+}
+
+std::unique_ptr<IPCObject> SharedRingBufferConsumer::pop(
+    int timeout_ms) {
+    auto raw_pair = pop_raw(timeout_ms);
+    if (!raw_pair) {
+        return nullptr;
+    }
+
+    auto metadata_json = std::move(raw_pair->first);
+    auto payload = std::move(raw_pair->second);
+
+    auto deserialized = deserialize(metadata_json, payload);
+    if (!deserialized) {
+        throw IPCException(IPCError::DeserializationFailed);
+    }
+
+    auto metadata_result = parse_metadata(metadata_json);
+    if (!metadata_result) {
+        throw IPCException(IPCError::InvalidMetadata, "Failed to parse metadata JSON");
+    }
+
+    auto ipc_obj = std::make_unique<IPCObject>(std::move(deserialized));
+    ipc_obj->raw_metadata = std::move(*metadata_result);
+    return ipc_obj;
 }
 
 // SharedRingBufferProducer implementation
@@ -692,10 +683,15 @@ bool SharedRingBufferProducer::push_raw(
     }
 }
 
-bool SharedRingBufferProducer::push(const SerializableObject& obj, int timeout_ms) {
-    // Serialize object
+void SharedRingBufferProducer::push(const SerializableObject& obj, 
+                                  int timeout_ms) {
     auto serialized = obj.serialize();
-    return push_raw(serialized.metadata_json, serialized.payload, timeout_ms);
+    if (!push_raw(serialized.metadata_json, serialized.payload, timeout_ms)) {
+        throw IPCException(
+            IPCError::DeserializationFailed,
+            "Failed to push object to ring buffer"
+        );
+    }
 }
 
 } // namespace ipc0cp

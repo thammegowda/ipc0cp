@@ -30,12 +30,22 @@ StdioProducer::StdioProducer(std::ostream* output)
     }
 }
 
-bool StdioProducer::push(const SerializableObject& obj) {
+void StdioProducer::push(const SerializableObject& obj, 
+                        int timeout_ms) {
     auto [metadata, payload] = obj.serialize();
-    return push_raw(metadata, payload);
+    (void)timeout_ms;
+    if (!push_raw(metadata, payload, timeout_ms)) {
+        throw IPCException(
+            IPCError::DeserializationFailed,
+            "Failed to push object"
+        );
+    }
 }
 
-bool StdioProducer::push_raw(const std::string& metadata_json, const std::vector<uint8_t>& payload) {
+bool StdioProducer::push_raw(const std::string& metadata_json,
+                             const std::vector<uint8_t>& payload,
+                             int timeout_ms) {
+    (void)timeout_ms;  // STDIO ignores timeout
     if (closed_) {
         throw IPCException(
             IPCError::NotInitialized,
@@ -122,10 +132,11 @@ StdioConsumer::StdioConsumer(std::istream* input)
     }
 }
 
-std::optional<IPCObject> StdioConsumer::pop(int timeout_ms) {
+std::unique_ptr<IPCObject> StdioConsumer::pop(
+    int timeout_ms) {
     auto result = pop_raw(timeout_ms);
     if (!result) {
-        return std::nullopt;
+        return nullptr;  // End-of-stream
     }
     
     auto& [metadata_json, payload] = *result;
@@ -133,7 +144,7 @@ std::optional<IPCObject> StdioConsumer::pop(int timeout_ms) {
     // Deserialize using the serialization system
     try {
         auto obj_ptr = deserialize(metadata_json, payload);
-        IPCObject ipc_obj(std::move(obj_ptr));
+        auto ipc_obj = std::make_unique<IPCObject>(std::move(obj_ptr));
         return ipc_obj;
     } catch (const std::exception& e) {
         throw IPCException(
@@ -142,6 +153,7 @@ std::optional<IPCObject> StdioConsumer::pop(int timeout_ms) {
         );
     }
 }
+
 
 std::optional<std::pair<std::string, std::vector<uint8_t>>> 
 StdioConsumer::pop_raw(int timeout_ms) {

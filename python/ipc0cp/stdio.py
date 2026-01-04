@@ -233,3 +233,15 @@ class StdioConsumer:
             )
 
 
+if __name__ == "__main__":
+    # Simple test: echo objects print objects from stdin (a consumer test)
+    consumer = StdioConsumer()
+    counter = 0
+    while True:
+        obj = consumer.pop()
+        if obj is None:
+            break
+        print(f"{counter}: {obj}")
+        counter += 1
+    print("End of stream reached. Total objects:", counter, file=sys.stderr)
+        

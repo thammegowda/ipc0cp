@@ -9,6 +9,7 @@
 #include <chrono>
 #include <map>
 #include <vector>
+#include <utility>
 #include <stdexcept>
 
 namespace ipc0cp {
@@ -127,7 +128,7 @@ protected:
  * }
  * @endcode
  */
-class SharedRingBufferConsumer : public SharedRingBufferBase {
+class SharedRingBufferConsumer : public SharedRingBufferBase, public IPCConsumer {
 public:
     /**
      * @brief Construct a consumer
@@ -155,17 +156,24 @@ public:
     /**
      * @brief Get last error
      */
-    IPCError get_last_error() const { return last_error_; }
+    IPCError get_last_error() const override { return last_error_; }
     
     /**
      * @brief Pop an object from the ring buffer
-     * @param timeout Maximum time to wait in milliseconds (nullopt = infinite if blocking)
-     * @return Deserialized object, or std::nullopt if end-of-stream marker received
+     * @param timeout_ms Timeout in milliseconds (<0 = infinite when blocking)
+     * @return Deserialized object, or nullptr if end-of-stream marker received
      * @throws IPCException with error_type indicating the error
      */
-    std::optional<IPCObject> pop(
-        std::optional<std::chrono::milliseconds> timeout = std::nullopt
-    );
+    std::unique_ptr<IPCObject> pop(
+        int timeout_ms = -1) override;
+    
+    std::optional<std::pair<std::string, std::vector<uint8_t>>> pop_raw(
+        int timeout_ms = -1) override;
+
+    /**
+     * @brief Check if end-of-stream was received
+     */
+    bool eos_received() const override { return eos_received_; }
 
 private:
     void set_read_pos(uint64_t pos);
@@ -175,7 +183,7 @@ private:
     uint64_t advance_pos(uint64_t pos, size_t delta);
     
     std::optional<std::map<std::string, std::string>> parse_metadata(
-        const std::vector<uint8_t>& metadata_bytes
+        const std::string& metadata_json
     );
     
     IPCError last_error_ = IPCError::NotInitialized;
@@ -189,7 +197,7 @@ private:
  * Writes serialized objects to a POSIX shared memory ring buffer.
  * Compatible with Python's SharedRingBufferProducer.
  */
-class SharedRingBufferProducer {
+class SharedRingBufferProducer : public IPCProducer {
 public:
     /**
      * @brief Construct producer with shared memory name
@@ -216,10 +224,11 @@ public:
     /**
      * @brief Push an object to the ring buffer
      * @param obj SerializableObject to push
-     * @param timeout_ms Maximum time to wait for space in milliseconds (0 = no wait, -1 = infinite)
-     * @return true if successful, false if buffer full or error
+     * @param timeout_ms Timeout in milliseconds (negative blocks indefinitely)
+     * @throws IPCException on errors
      */
-    bool push(const SerializableObject& obj, int timeout_ms = -1);
+    void push(const SerializableObject& obj, 
+             int timeout_ms = -1) override;
     
     /**
      * @brief Push pre-serialized data
@@ -235,12 +244,13 @@ public:
     );
     
     /**
-     * @brief Close the producer by sending end-of-stream marker.
+     * @brief Close the producer by sending end-of-stream marker (IPCProducer interface).
      * 
      * Sends a slot with payload_size=0 to signal the consumer to stop,
      * then closes and unlinks the shared memory.
+     * @throws IPCException on errors
      */
-    void close();
+    void close() override;
     
     /**
      * @brief Get available space in buffer

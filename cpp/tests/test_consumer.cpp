@@ -8,7 +8,7 @@
 
 using namespace ipc0cp;
 
-void printObject(const RingBufferObject& obj) {
+void printObject(const IPCObject& obj) {
     std::cout << "Received object:" << std::endl;
     std::cout << "  Type: " << objectTypeToString(obj.get_type()) << std::endl;
     
@@ -129,7 +129,7 @@ int main(int argc, char* argv[]) {
     auto start_time = std::chrono::steady_clock::now();
     
     while (true) {
-        auto obj = consumer.pop(std::chrono::seconds(5));
+        auto obj = consumer.pop(static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::seconds(5)).count()));
         
         if (!obj) {
             std::cout << "No more objects (timeout or empty)" << std::endl;
