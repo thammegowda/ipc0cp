@@ -38,7 +38,6 @@ class TestSharedRingBufferGenericObjects:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_json_objects(self):
         """Test with JSON-serializable objects."""
@@ -66,7 +65,6 @@ class TestSharedRingBufferGenericObjects:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_raw_bytes(self):
         """Test with raw bytes."""
@@ -92,7 +90,6 @@ class TestSharedRingBufferGenericObjects:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_pil_images(self):
         """Test with actual PIL Image objects."""
@@ -125,7 +122,6 @@ class TestSharedRingBufferGenericObjects:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_mixed_object_types(self):
         """Test pushing different object types in sequence."""
@@ -171,7 +167,6 @@ class TestSharedRingBufferGenericObjects:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
 
     def test_list_payload_bytes_json_text(self):
         """Test pushing a list containing bytes, JSON, and text."""
@@ -193,7 +188,6 @@ class TestSharedRingBufferGenericObjects:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_metadata_size_limit(self):
         """Test that metadata respects the 1024 byte limit."""
@@ -224,7 +218,9 @@ class TestSharedRingBufferGenericObjects:
             pass
         finally:
             producer.close()
-            producer.unlink()
+            # Cleanup is consumer-owned; attach a consumer solely to unlink.
+            consumer = SharedRingBufferConsumer(shm_name=shm_name)
+            consumer.close()
 
 
 class TestSharedRingBufferPillow:
@@ -258,7 +254,6 @@ class TestSharedRingBufferPillow:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_pillow_grayscale(self):
         """Test with Pillow grayscale images."""
@@ -280,7 +275,6 @@ class TestSharedRingBufferPillow:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
 
 
 if __name__ == "__main__":

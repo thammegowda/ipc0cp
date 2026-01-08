@@ -15,6 +15,30 @@ import pytest
 from ipc0cp.ring_buffer import SharedRingBufferProducer, SharedRingBufferConsumer
 
 
+def _cleanup_ipc(name: str) -> None:
+    """Best-effort cleanup for shared memory + semaphores."""
+    import posix_ipc
+
+    base = name.strip().lstrip("/")
+    if not base:
+        return
+
+    for sem_suffix in ("_mutex", "_wait"):
+        try:
+            posix_ipc.unlink_semaphore(f"/{base}{sem_suffix}")
+        except posix_ipc.ExistentialError:
+            pass
+        except Exception:
+            pass
+
+    try:
+        posix_ipc.unlink_shared_memory(f"/{base}")
+    except posix_ipc.ExistentialError:
+        pass
+    except Exception:
+        pass
+
+
 class TestSharedRingBufferMultiprocess:
     """Test with separate producer and consumer processes."""
     
@@ -55,13 +79,7 @@ class TestSharedRingBufferMultiprocess:
         shm_name = "test_multiprocess"
         num_images = 20
         
-        # Clean up any existing shared memory
-        try:
-            cleanup = SharedRingBufferProducer(shm_name=shm_name)
-            cleanup.close()
-            cleanup.unlink()
-        except:
-            pass
+        _cleanup_ipc(shm_name)
         
         results_queue = multiprocessing.Queue()
         
@@ -88,27 +106,14 @@ class TestSharedRingBufferMultiprocess:
         
         assert len(received) == num_images
         assert received == expected
-        
-        # Cleanup
-        try:
-            cleanup = SharedRingBufferProducer(shm_name=shm_name)
-            cleanup.close()
-            cleanup.unlink()
-        except:
-            pass
+        _cleanup_ipc(shm_name)
     
     def test_high_throughput(self):
         """Test high throughput with many small images."""
         shm_name = "test_throughput"
         num_images = 100
         
-        # Clean up any existing shared memory
-        try:
-            cleanup = SharedRingBufferProducer(shm_name=shm_name)
-            cleanup.close()
-            cleanup.unlink()
-        except:
-            pass
+        _cleanup_ipc(shm_name)
         
         results_queue = multiprocessing.Queue()
         
@@ -139,13 +144,7 @@ class TestSharedRingBufferMultiprocess:
         throughput = num_images / elapsed
         print(f"\nThroughput: {throughput:.1f} images/second")
         
-        # Cleanup
-        try:
-            cleanup = SharedRingBufferProducer(shm_name=shm_name)
-            cleanup.close()
-            cleanup.unlink()
-        except:
-            pass
+        _cleanup_ipc(shm_name)
 
 
 class TestSharedRingBufferSubprocessIPC:
@@ -165,13 +164,7 @@ class TestSharedRingBufferSubprocessIPC:
         assert producer_script.exists(), f"Producer script not found: {producer_script}"
         assert consumer_script.exists(), f"Consumer script not found: {consumer_script}"
         
-        # Clean up any existing shared memory
-        try:
-            cleanup = SharedRingBufferProducer(shm_name=shm_name)
-            cleanup.close()
-            cleanup.unlink()
-        except:
-            pass
+        _cleanup_ipc(shm_name)
         
         # Start consumer first (it will wait for producer)
         consumer_process = subprocess.Popen(
@@ -223,13 +216,7 @@ class TestSharedRingBufferSubprocessIPC:
             consumer_process.kill()
             pytest.fail("Subprocess test timed out")
         
-        # Final cleanup
-        try:
-            cleanup = SharedRingBufferProducer(shm_name=shm_name)
-            cleanup.close()
-            cleanup.unlink()
-        except:
-            pass
+        _cleanup_ipc(shm_name)
 
 
 if __name__ == "__main__":

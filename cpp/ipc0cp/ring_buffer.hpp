@@ -20,13 +20,20 @@ using RingBufferException = IPCException;
 using RingBufferObject = IPCObject;
 
 /**
- * Shared Ring Buffer Memory Layout
- * =================================
+ * Shared Ring Buffer Memory Layout (MPMC)
+ * ========================================
  * 
- * Header (24 bytes):
- *   - write_pos (uint64, 8 bytes): ABSOLUTE byte position (write position / location) of next slot
- *   - read_pos (uint64, 8 bytes): ABSOLUTE byte position (read position / location) of next slot
+ * Header (64 bytes):
+ *   - write_pos (uint64, 8 bytes): ABSOLUTE byte position of next write slot
+ *   - read_pos (uint64, 8 bytes): ABSOLUTE byte position of next read slot
  *   - total_data_bytes (uint64, 8 bytes): Total size of data region
+ *   - active_producers (uint32, 4 bytes): Number of active producers
+ *   - active_consumers (uint32, 4 bytes): Number of active consumers
+ *   - total_producers_joined (uint32, 4 bytes): Total producers that have joined
+ *   - total_consumers_joined (uint32, 4 bytes): Total consumers that have joined
+ *   - reserved (24 bytes): Reserved for future use
+ * 
+ * Synchronization uses named POSIX semaphores: {shm_name}_lock and {shm_name}_cond
  * 
  * Data Region (variable size):
  *   Each slot contains:

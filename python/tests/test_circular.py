@@ -43,7 +43,6 @@ class TestSharedRingBufferCircular:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_wraparound_during_write(self):
         """Test wraparound in the middle of writing a slot."""
@@ -103,7 +102,6 @@ class TestSharedRingBufferCircular:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
 
 
 if __name__ == "__main__":

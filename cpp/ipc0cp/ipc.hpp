@@ -31,6 +31,9 @@ enum class IPCError {
     InvalidSlot,
     Timeout,
     BufferEmpty,
+    BufferFull,
+    NoConsumers,
+    NoProducers,
     DeserializationFailed,
     CorruptPayload
 };
@@ -48,6 +51,9 @@ inline std::string errorToString(IPCError error) {
         case IPCError::InvalidSlot: return "Invalid slot data";
         case IPCError::Timeout: return "Operation timed out";
         case IPCError::BufferEmpty: return "Buffer is empty";
+        case IPCError::BufferFull: return "Buffer is full";
+        case IPCError::NoConsumers: return "No active consumers";
+        case IPCError::NoProducers: return "No active producers";
         case IPCError::DeserializationFailed: return "Deserialization failed";
         case IPCError::CorruptPayload: return "Corrupt payload";
         default: return "Unknown error";

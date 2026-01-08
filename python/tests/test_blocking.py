@@ -24,6 +24,13 @@ class TestSharedRingBufferBlocking:
             total_data_bytes=200 * 1024,  # 200 KB
             blocking=True,
         )
+
+        # Attach at least one consumer so producers are allowed to proceed.
+        consumer = SharedRingBufferConsumer(
+            shm_name=shm_name,
+            total_data_bytes=200 * 1024,  # Must match producer
+            blocking=True,
+        )
         
         try:
             # Fill buffer
@@ -42,8 +49,8 @@ class TestSharedRingBufferBlocking:
             stats = producer.get_stats()
             assert stats['available_bytes'] < 50 * 1024
         finally:
+            consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_buffer_empty_nonblocking(self):
         """Test that consumer raises exception when buffer is empty and non-blocking."""
@@ -70,7 +77,6 @@ class TestSharedRingBufferBlocking:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_buffer_empty_blocking_timeout(self):
         """Test that consumer respects timeout when buffer is empty."""
@@ -101,7 +107,6 @@ class TestSharedRingBufferBlocking:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
 
 
 if __name__ == "__main__":

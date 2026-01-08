@@ -53,7 +53,6 @@ class TestSharedRingBufferVariableSize:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_large_image(self):
         """Test with large images close to max_slot_size."""
@@ -80,7 +79,6 @@ class TestSharedRingBufferVariableSize:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_oversized_image_rejected(self):
         """Test that images larger than max_slot_size are rejected."""
@@ -101,7 +99,9 @@ class TestSharedRingBufferVariableSize:
             assert result is False
         finally:
             producer.close()
-            producer.unlink()
+            # Cleanup is consumer-owned; attach a consumer solely to unlink.
+            consumer = SharedRingBufferConsumer(shm_name=shm_name)
+            consumer.close()
 
 
 if __name__ == "__main__":
