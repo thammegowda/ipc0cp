@@ -11,8 +11,6 @@
 #include <string_view>
 #include <vector>
 
-#include <sys/mman.h>
-
 using namespace ipc0cp;
 
 namespace {
@@ -143,10 +141,6 @@ int main(int argc, char** argv) {
         }
 
         producer.close();
-
-        // Ensure SHM is cleaned up even if consumer doesn't auto-unlink.
-        // Ignore errors (e.g., already unlinked).
-        shm_unlink(config.shm_name.c_str());
     }
 
     const auto elapsed = std::chrono::duration<double>(

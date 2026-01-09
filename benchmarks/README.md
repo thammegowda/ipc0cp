@@ -42,6 +42,13 @@ Disable C++ variants (Python-only):
 python run_benchmark.py --no-cpp
 ```
 
+Enable additional multi-producer / multi-consumer (MPMC) SHM scenarios:
+
+```bash
+python run_benchmark.py --mpmc
+python run_benchmark.py --mpmc --mpmc-scenarios 2x2,4x4
+```
+
 ## Benchmark variants
 
 When C++ binaries are available, the harness runs:
@@ -109,3 +116,7 @@ The JSON includes:
 
 - SHM uses a large shared memory segment (2GB by default in the benchmark scripts). Ensure you have enough shared memory available.
 - If a run crashes, you may need to clean up leftover segments under `/dev/shm/` (Linux).
+
+Lifecycle note (MPMC):
+
+- Producers do not unlink shared memory; cleanup is owned by the last consumer.
