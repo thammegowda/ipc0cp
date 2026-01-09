@@ -77,7 +77,6 @@ def consumer_process(shm_name: str, consumer_id: int, results_queue):
         try:
             consumer = SharedRingBufferConsumer(
                 shm_name=shm_name,
-                total_data_bytes=10 * 1024 * 1024,
                 blocking=True
             )
             break  # Success

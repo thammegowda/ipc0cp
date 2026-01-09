@@ -22,7 +22,6 @@ class TestSharedRingBufferVariableSize:
         )
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=50 * 1024 * 1024,
         )
         
         try:
@@ -64,7 +63,6 @@ class TestSharedRingBufferVariableSize:
         )
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=100 * 1024 * 1024,
         )
         
         try:

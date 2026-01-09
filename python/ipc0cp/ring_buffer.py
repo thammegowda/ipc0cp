@@ -680,7 +680,6 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
     def __init__(
         self,
         shm_name: str,
-        total_data_bytes: int = DEFAULT_TOTAL_DATA_BYTES,
         blocking: bool = True,
         max_slot_size: int = MAX_SLOT_SIZE,
         auto_attach: bool = True,
@@ -691,13 +690,14 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         
         Args:
             shm_name: Name of the POSIX shared memory segment
-            total_data_bytes: Total size of the data region in bytes (should match producer)
             blocking: Whether to block when buffer is empty
             max_slot_size: Maximum allowed size per slot (default 10MB)
             auto_attach: If True, automatically attach to shared memory in constructor
             auto_unlink: If True, automatically unlink (delete) shared memory when EOS is received
         """
-        super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
+        # total_data_bytes is stored in the shared memory header; consumers always
+        # auto-detect it during attach.
+        super().__init__(shm_name, 0, blocking, max_slot_size)
         self.eos_received = False  # Track if end-of-stream was received
         self.auto_unlink = auto_unlink
         if auto_attach:
@@ -743,22 +743,27 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             
             # Attach to existing POSIX semaphores for cross-process synchronization
             self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=False)
-            
-            # Verify size matches
-            if self.shm.size != self.shm_size:
-                raise ValueError(
-                    f"Shared memory size mismatch: expected {self.shm_size}, "
-                    f"got {self.shm.size}"
-                )
-            
-            # Read total_data_bytes from header
+
+            if self.shm.size < HEADER_SIZE:
+                raise ValueError(f"Shared memory too small: got {self.shm.size}")
+
+            # Read total_data_bytes from header and validate against the actual SHM size.
             _, _, stored_total = struct.unpack_from('<QQQ', self.shm.buf, HeaderOffset.WRITE_POS)
-            if stored_total != self.total_data_bytes:
+            if stored_total <= 0:
+                raise ValueError("Invalid total_data_bytes in header")
+
+            expected_shm_size = HEADER_SIZE + int(stored_total)
+            if self.shm.size != expected_shm_size:
+                raise ValueError(
+                    f"Shared memory size mismatch: expected {expected_shm_size}, got {self.shm.size}"
+                )
+
+            if self.total_data_bytes not in (0, int(stored_total)):
                 logger.warning(
                     f"total_data_bytes mismatch: using stored value {stored_total}"
                 )
-                self.total_data_bytes = stored_total
-                self.shm_size = HEADER_SIZE + stored_total
+            self.total_data_bytes = int(stored_total)
+            self.shm_size = expected_shm_size
             
             # Register this consumer
             self._increment_active_consumers()

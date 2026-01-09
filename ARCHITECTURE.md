@@ -94,7 +94,7 @@ producer.close();  // Decrements active_producers
 **Consumer Side:**
 ```python
 # Python
-consumer = SharedRingBufferConsumer("buffer", 1024*1024*100)
+consumer = SharedRingBufferConsumer("buffer")
 while True:
     try:
         payload = consumer.pop()
@@ -109,7 +109,7 @@ while True:
 
 ```cpp
 // C++
-auto consumer = SharedRingBufferConsumer("buffer", 1024*1024*100);
+auto consumer = SharedRingBufferConsumer("buffer");
 while (true) {
     try {
         auto payload = consumer.pop();

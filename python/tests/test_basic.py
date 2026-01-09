@@ -26,7 +26,6 @@ class TestSharedRingBufferBasic:
             # Attach to same buffer
             consumer = SharedRingBufferConsumer(
                 shm_name=shm_name,
-                total_data_bytes=1024 * 1024,
             )
             
             try:

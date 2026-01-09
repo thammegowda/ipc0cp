@@ -9,8 +9,6 @@ that will be consumed by the C++ consumer test program.
 import sys
 import time
 import argparse
-import numpy as np
-from PIL import Image
 from pathlib import Path
 
 
@@ -52,32 +50,22 @@ def main():
         start_time = time.time()
         
         for i in range(args.num_objects):
-            # Vary the object types
-            obj_type = i % 5
-            
+            # Keep this script dependency-free so it runs in minimal CI images.
+            # Only use object types that do not require optional packages.
+            obj_type = i % 3
+
             if obj_type == 0:
-                # NumPy array
-                obj = np.random.rand(100, 100, 3).astype(np.float32)
-                obj_desc = f"NumPy array {obj.shape}"
-            elif obj_type == 1:
-                # Text string
                 obj = f"Hello from Python! Message #{i}"
                 obj_desc = f"Text: {obj}"
-            elif obj_type == 2:
-                # JSON object
+            elif obj_type == 1:
                 obj = {
                     "message": f"Object #{i}",
                     "timestamp": time.time(),
-                    "data": [1, 2, 3, 4, 5]
+                    "data": [1, 2, 3, 4, 5],
                 }
-                obj_desc = f"JSON: {obj}"
-            elif obj_type == 3:
-                # PIL Image
-                obj = Image.new('RGB', (200, 150), color=(i * 10 % 256, i * 20 % 256, i * 30 % 256))
-                obj_desc = f"PIL Image {obj.size} mode={obj.mode}"
+                obj_desc = "JSON object"
             else:
-                # Raw bytes
-                obj = bytes([i % 256] * 1000)
+                obj = bytes([i % 256] * 1024)
                 obj_desc = f"Bytes: {len(obj)} bytes"
             
             success = producer.push(obj)
@@ -87,11 +75,12 @@ def main():
                 print(f"[{i+1}/{args.num_objects}] Failed to push: {obj_desc}")
             
             # Small delay to allow consumer to process
-            time.sleep(0.01)
+            time.sleep(0.005)
         
         elapsed = time.time() - start_time
         print(f"\nPushed {args.num_objects} objects in {elapsed:.2f} seconds")
-        print(f"Average: {elapsed/args.num_objects*1000:.2f} ms/object")
+        if args.num_objects > 0:
+            print(f"Average: {elapsed/args.num_objects*1000:.2f} ms/object")
         
         # Get final stats
         stats = producer.get_stats()
@@ -108,8 +97,8 @@ def main():
         time.sleep(2)
         
         producer.close()
-        producer.unlink()
-        print("Cleaned up shared memory")
+        # Producers do not own shared-memory cleanup; the last consumer unlinks.
+        print("Producer closed (consumer will clean up shared memory)")
 
 
 if __name__ == "__main__":

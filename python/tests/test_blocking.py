@@ -28,7 +28,6 @@ class TestSharedRingBufferBlocking:
         # Attach at least one consumer so producers are allowed to proceed.
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=200 * 1024,  # Must match producer
             blocking=True,
         )
         
@@ -65,7 +64,6 @@ class TestSharedRingBufferBlocking:
         
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=200 * 1024,  # Must match producer
             blocking=False,
         )
         
@@ -91,7 +89,6 @@ class TestSharedRingBufferBlocking:
         
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=200 * 1024,  # Must match producer
             blocking=True,
         )
         

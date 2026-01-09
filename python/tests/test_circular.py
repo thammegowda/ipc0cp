@@ -23,7 +23,6 @@ class TestSharedRingBufferCircular:
         )
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=500 * 1024,
         )
         
         try:
@@ -55,7 +54,6 @@ class TestSharedRingBufferCircular:
         )
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=100 * 1024,
         )
         
         try:

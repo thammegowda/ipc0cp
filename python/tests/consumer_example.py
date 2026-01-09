@@ -28,11 +28,10 @@ def main():
     # Wait a bit for producer to create the buffer
     time.sleep(args.wait_time)
     
-    buffer = SharedRingBufferConsumer(
-        shm_name=shm_name,
-        total_data_bytes=args.buffer_size * 1024 * 1024,
-        blocking=True,
-    )
+        buffer = SharedRingBufferConsumer(
+            shm_name=shm_name,
+            blocking=True,
+        )
     
     print(f"Consumer attached to shared memory: {shm_name}")
     

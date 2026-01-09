@@ -108,7 +108,7 @@ struct IPCObject {
 };
 
 // Shared constants used by multiple IPC transports
-constexpr size_t HEADER_SIZE = 24;  // 3 * uint64: write_pos, read_pos, total_data_bytes
+constexpr size_t HEADER_SIZE = 64;  // Extended for MPMC: write_pos(8) + read_pos(8) + total_bytes(8) + counters(16) + reserved(24)
 constexpr size_t SLOT_HEADER_SIZE = 20;  // next_pos(8) + metadata_size(4) + payload_size(8)
 constexpr uint8_t SENTINEL_BYTE = 0x00;
 constexpr size_t MAX_METADATA_SIZE = 1024;

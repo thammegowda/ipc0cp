@@ -38,6 +38,7 @@ FetchContent_MakeAvailable(googletest)
 set(IPC0CP_SOURCES
     cpp/ipc0cp/serialize.cpp
     cpp/ipc0cp/type_registry.cpp
+    cpp/ipc0cp/posix_sync.cpp
     cpp/ipc0cp/ring_buffer.cpp
     cpp/ipc0cp/stdio.cpp
 )
@@ -46,6 +47,7 @@ set(IPC0CP_HEADERS
     cpp/ipc0cp/ipc.hpp
     cpp/ipc0cp/serialize.hpp
     cpp/ipc0cp/type_registry.hpp
+    cpp/ipc0cp/posix_sync.hpp
     cpp/ipc0cp/ring_buffer.hpp
     cpp/ipc0cp/stdio.hpp
 )
@@ -56,7 +58,7 @@ target_include_directories(ipc0cp_static PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(ipc0cp_static PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(ipc0cp_static PUBLIC nlohmann_json::nlohmann_json rt)
 set_target_properties(ipc0cp_static PROPERTIES
     OUTPUT_NAME ipc0cp
     VERSION ${PROJECT_VERSION}
@@ -68,7 +70,7 @@ target_include_directories(ipc0cp_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
     $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(ipc0cp_shared PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(ipc0cp_shared PUBLIC nlohmann_json::nlohmann_json rt)
 set_target_properties(ipc0cp_shared PROPERTIES
     OUTPUT_NAME ipc0cp
     VERSION ${PROJECT_VERSION}
@@ -99,29 +101,34 @@ endif()
 if(BUILD_TESTS)
     enable_testing()
     
-    # Test: Serialization
-    add_executable(test_serialization cpp/tests/test_serialization.cpp)
-    target_link_libraries(test_serialization PRIVATE 
-        ipc0cp_static 
-        GTest::gtest 
+    # Common test libraries
+    set(TEST_LIBS
+        ipc0cp_static
+        GTest::gtest
         GTest::gtest_main
         rt
     )
+    
+    # Test: Serialization
+    add_executable(test_serialization cpp/tests/test_serialization.cpp)
+    target_link_libraries(test_serialization PRIVATE ${TEST_LIBS})
     target_include_directories(test_serialization PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
     add_test(NAME SerializationTest COMMAND test_serialization)
     set_tests_properties(SerializationTest PROPERTIES TIMEOUT 10)
     
     # Test: Ring Buffer
     add_executable(test_ring_buffer cpp/tests/test_ring_buffer.cpp)
-    target_link_libraries(test_ring_buffer PRIVATE 
-        ipc0cp_static 
-        GTest::gtest 
-        GTest::gtest_main
-        rt
-    )
+    target_link_libraries(test_ring_buffer PRIVATE ${TEST_LIBS})
     target_include_directories(test_ring_buffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
     add_test(NAME RingBufferTest COMMAND test_ring_buffer)
-    set_tests_properties(RingBufferTest PROPERTIES TIMEOUT 30)
+    set_tests_properties(RingBufferTest PROPERTIES TIMEOUT 15)
+    
+    # Test: MPMC (Multi-Producer Multi-Consumer)
+    add_executable(test_mpmc cpp/tests/test_mpmc.cpp)
+    target_link_libraries(test_mpmc PRIVATE ${TEST_LIBS} pthread)
+    target_include_directories(test_mpmc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
+    add_test(NAME MPMCTest COMMAND test_mpmc)
+    set_tests_properties(MPMCTest PROPERTIES TIMEOUT 15)
     
     # Legacy test consumer (for cross-language testing)
     add_executable(test_consumer cpp/tests/test_consumer.cpp)
@@ -139,5 +146,7 @@ if(BUILD_TESTS)
             TIMEOUT 30
             ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python;CMAKE_BINARY_DIR=${CMAKE_BINARY_DIR}"
         )
+    else()
+        message(FATAL_ERROR "python3 is required for cross-language tests")
     endif()
 endif()
