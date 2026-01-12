@@ -325,11 +325,13 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
         
         if create_if_not_exists:
-            # Try to create, fallback to attach if already exists
+            # Try to create, fallback to attach if already exists or on error
             try:
                 self._create()
-            except FileExistsError:
-                # Already exists, attach instead
+            except (FileExistsError, IPCException, Exception) as e:
+                # Already exists, or error creating semaphores (stale resources)
+                # Try to attach instead
+                logger.debug(f"Failed to create buffer: {e}. Attempting to attach instead.")
                 self._attach_producer()
         else:
             # Always attach
@@ -416,7 +418,13 @@ class SharedRingBufferProducer(SharedRingBufferBase):
             self.shm = _PosixSharedMemory(self.shm_name, create=False)
             
             # Attach to existing POSIX semaphores for cross-process synchronization
-            self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=False)
+            try:
+                self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=False)
+            except FileNotFoundError:
+                # Semaphores don't exist but shared memory does - likely crash recovery
+                logger.warning(f"Semaphores missing for buffer '{self.shm_name}'. Attempting recovery...")
+                # Try creating them (they'll be initialized fresh, which is OK for recovery)
+                self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=True)
             
             # Verify size matches
             if self.shm.size != self.shm_size:

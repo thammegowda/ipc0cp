@@ -225,7 +225,7 @@ def get_buffer_semaphores(buffer_name: str, create: bool = False):
 
     try:
         if create:
-            # Clean up any existing semaphores first
+            # Clean up any existing semaphores first (from previous crashed runs)
             try:
                 posix_ipc.unlink_semaphore(mutex_name)
             except posix_ipc.ExistentialError:
@@ -239,16 +239,29 @@ def get_buffer_semaphores(buffer_name: str, create: bool = False):
             mutex_sem = posix_ipc.Semaphore(mutex_name, flags=flags, mode=mode, initial_value=1)
             wait_sem = posix_ipc.Semaphore(wait_name, flags=flags, mode=mode, initial_value=0)
         else:
-            mutex_sem = posix_ipc.Semaphore(mutex_name)
-            wait_sem = posix_ipc.Semaphore(wait_name)
+            # Try to attach to existing semaphores
+            try:
+                mutex_sem = posix_ipc.Semaphore(mutex_name)
+                wait_sem = posix_ipc.Semaphore(wait_name)
+            except posix_ipc.ExistentialError as e:
+                raise FileNotFoundError(
+                    f"Semaphores not found for buffer '{buffer_name}': {e}"
+                )
 
         condition = PosixCondition(mutex_sem, wait_sem)
         return mutex_sem, condition
 
+    except FileNotFoundError:
+        raise
     except posix_ipc.ExistentialError as e:
         raise IPCException(
             IPCError.SYSTEM_ERROR,
             f"Failed to {'create' if create else 'attach to'} POSIX semaphores for buffer '{buffer_name}': {e}",
+        )
+    except Exception as e:
+        raise IPCException(
+            IPCError.SYSTEM_ERROR,
+            f"Unexpected error managing POSIX semaphores for buffer '{buffer_name}': {e}",
         )
 
 

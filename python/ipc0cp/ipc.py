@@ -20,6 +20,7 @@ class IPCError:
     NO_PRODUCERS = "NoProducers"
     DESERIALIZATION_FAILED = "DeserializationFailed"
     CORRUPT_PAYLOAD = "CorruptPayload"
+    SYSTEM_ERROR = "SystemError"
 
 
 class IPCException(Exception):
