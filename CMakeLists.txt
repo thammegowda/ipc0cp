@@ -91,18 +91,18 @@ install(FILES ${IPC0CP_HEADERS}
 )
 
 # Optional: Build examples and tests
-option(BUILD_EXAMPLES "Build example programs" OFF)
-option(BUILD_TESTS "Build tests" ON)
+option(IPC0CP_EXAMPLES "Build example programs" OFF)
+option(IPC0CP_TESTS "Build tests" ON)
 
-if(BUILD_EXAMPLES)
+if(IPC0CP_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
-if(BUILD_TESTS)
+if(IPC0CP_TESTS)
     enable_testing()
     
     # Common test libraries
-    set(TEST_LIBS
+    set(IPC0CP_TEST_LIBS
         ipc0cp_static
         GTest::gtest
         GTest::gtest_main
@@ -111,21 +111,21 @@ if(BUILD_TESTS)
     
     # Test: Serialization
     add_executable(test_serialization cpp/tests/test_serialization.cpp)
-    target_link_libraries(test_serialization PRIVATE ${TEST_LIBS})
+    target_link_libraries(test_serialization PRIVATE ${IPC0CP_TEST_LIBS})
     target_include_directories(test_serialization PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
     add_test(NAME SerializationTest COMMAND test_serialization)
     set_tests_properties(SerializationTest PROPERTIES TIMEOUT 10)
     
     # Test: Ring Buffer
     add_executable(test_ring_buffer cpp/tests/test_ring_buffer.cpp)
-    target_link_libraries(test_ring_buffer PRIVATE ${TEST_LIBS})
+    target_link_libraries(test_ring_buffer PRIVATE ${IPC0CP_TEST_LIBS})
     target_include_directories(test_ring_buffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
     add_test(NAME RingBufferTest COMMAND test_ring_buffer)
     set_tests_properties(RingBufferTest PROPERTIES TIMEOUT 15)
     
     # Test: MPMC (Multi-Producer Multi-Consumer)
     add_executable(test_mpmc cpp/tests/test_mpmc.cpp)
-    target_link_libraries(test_mpmc PRIVATE ${TEST_LIBS} pthread)
+    target_link_libraries(test_mpmc PRIVATE ${IPC0CP_TEST_LIBS} pthread)
     target_include_directories(test_mpmc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
     add_test(NAME MPMCTest COMMAND test_mpmc)
     set_tests_properties(MPMCTest PROPERTIES TIMEOUT 15)
