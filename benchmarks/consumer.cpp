@@ -17,7 +17,6 @@ struct Config {
     std::string shm_name;
 
     bool quiet = false;
-    size_t shm_total_data_bytes = 2ULL * 1024 * 1024 * 1024;
 
     std::chrono::seconds attach_timeout{5};
 };
@@ -87,10 +86,8 @@ int main(int argc, char** argv) {
 
         SharedRingBufferConsumer consumer(
             config.shm_name,
-            config.shm_total_data_bytes,
-            true,
-            false,
-            true
+            /*blocking=*/true,
+            /*auto_unlink=*/true
         );
 
         const auto attach_deadline = std::chrono::steady_clock::now() + config.attach_timeout;

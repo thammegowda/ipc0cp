@@ -15,8 +15,12 @@ class IPCError:
     INVALID_SLOT = "InvalidSlot"
     TIMEOUT = "Timeout"
     BUFFER_EMPTY = "BufferEmpty"
+    BUFFER_FULL = "BufferFull"
+    NO_CONSUMERS = "NoConsumers"
+    NO_PRODUCERS = "NoProducers"
     DESERIALIZATION_FAILED = "DeserializationFailed"
     CORRUPT_PAYLOAD = "CorruptPayload"
+    SYSTEM_ERROR = "SystemError"
 
 
 class IPCException(Exception):

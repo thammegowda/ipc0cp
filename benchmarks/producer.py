@@ -128,9 +128,8 @@ def produce_shm(shm_name: str, min_size: int, max_size: int, duration: float) ->
             'throughput_mbps': (bytes_sent / elapsed_time) / (1024 * 1024),
         }
     finally:
-        # Close sends EOS marker and cleans up
+        # Close signals EOS. Shared memory cleanup is owned by the last consumer.
         producer.close()
-        producer.unlink()
 
 
 def produce_stdio_api(min_size: int, max_size: int, duration: float) -> dict:

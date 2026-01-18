@@ -30,7 +30,6 @@ def main():
     
     buffer = SharedRingBufferConsumer(
         shm_name=shm_name,
-        total_data_bytes=args.buffer_size * 1024 * 1024,
         blocking=True,
     )
     

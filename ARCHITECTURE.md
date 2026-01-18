@@ -3,38 +3,36 @@
 ## High-Level Design
 
 ```
-┌─────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────┐
 │                     Shared Memory Region                     │
 │                                                              │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │              Header (24 bytes)                      │    │
-│  │  ┌──────────────┬──────────────┬──────────────┐   │    │
-│  │  │ write_pos    │ read_pos     │ total_bytes  │   │    │
-│  │  │   (uint64)   │   (uint64)   │   (uint64)   │   │    │
-│  │  └──────────────┴──────────────┴──────────────┘   │    │
-│  └────────────────────────────────────────────────────┘    │
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │                 Header (64 bytes)                      │  │
+│  │                                                       │   │
+│  │  write_pos (uint64)   read_pos (uint64)   total_bytes  │  │
+│  │  active_prod (uint32) active_cons (uint32) reserved    │  │
+│  └───────────────────────────────────────────────────────┘   │
 │                                                              │
-│  ┌────────────────────────────────────────────────────┐    │
-│  │              Data Region (Variable)                 │    │
-│  │                                                     │    │
-│  │  ┌─────────┐      ┌─────────┐      ┌─────────┐   │    │
-│  │  │ Slot 0  │ ───> │ Slot 1  │ ───> │ Slot 2  │   │    │
-│  │  └─────────┘      └─────────┘      └─────────┘   │    │
-│  │       │                │                │          │    │
-│  │       │                │                │          │    │
-│  │  ┌────▼────────────────▼────────────────▼──────┐  │    │
-│  │  │   Circular linked list of variable slots   │  │    │
-│  │  └────────────────────────────────────────────┘  │    │
-│  └────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
+│  ┌───────────────────────────────────────────────────────┐   │
+│  │              Data Region (Variable)                    │  │
+│  │                                                       │   │
+│  │   ┌─────────┐      ┌─────────┐      ┌─────────┐        │  │
+│  │   │ Slot 0  │ ───> │ Slot 1  │ ───> │ Slot 2  │        │  │
+│  │   └─────────┘      └─────────┘      └─────────┘        │  │
+│  │        │                │                │             │  │
+│  │   ┌────▼────────────────▼────────────────▼─────────┐   │  │
+│  │   │   Circular linked list of variable slots       │   │  │
+│  │   └───────────────────────────────────────────────┘   │   │
+│  └───────────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────────┘
 
-Producer (Process 1)          Consumer (Process 2)
-    │                              │
-    │  Writes at write_pos        │  Reads at read_pos
-    │  Updates write_pos ─────────│────> Observes write_pos
-    │                              │  Updates read_pos
-    │  Observes read_pos <────────│
-    └──────────────────────────────┘
+Producer (Process 1)                    Consumer (Process 2)
+    │                                          │
+    │  Writes at write_pos                     │  Reads at read_pos
+    │  Updates write_pos ──────────────────────│───> Observes write_pos
+    │                                          │  Updates read_pos
+    │  Observes read_pos <─────────────────────│
+    └──────────────────────────────────────────┘
 ```
 
 ## Slot Structure
@@ -68,13 +66,13 @@ buffer overruns and data corruption during read.
 
 ## End-of-Stream Signaling
 
-The ring buffer supports explicit end-of-stream (EOS) notification to signal 
-when the producer has finished sending data.
+The ring buffer uses an *implicit* end-of-stream (EOS) mechanism based on an
+`active_producers` counter in the header.
 
-**EOS Marker:**
-- A slot with `payload_size == 0` is used as the end-of-stream marker
-- Producer sends EOS by calling `close()` method (automatically pushes EOS marker)
-- Consumer detects EOS when `pop()` returns `None`/`nullopt`
+**EOS behavior:**
+- Producers increment `active_producers` on attach and decrement it on `close()`.
+- Consumers treat EOS as: buffer is empty **and** `active_producers == 0`.
+- `pop()` returns `None` only for EOS; timeouts/corruption/etc raise exceptions.
 
 **Producer Side:**
 ```python
@@ -82,7 +80,7 @@ when the producer has finished sending data.
 producer = SharedRingBufferProducer("buffer", 1024*1024*100)
 producer.push(data)
 # ... send more data ...
-producer.close()  # Automatically sends EOS marker
+producer.close()  # Decrements active_producers
 ```
 
 ```cpp
@@ -90,13 +88,13 @@ producer.close()  # Automatically sends EOS marker
 auto producer = SharedRingBufferProducer("buffer", 1024*1024*100);
 producer.push(data);
 // ... send more data ...
-producer.close();  // Automatically sends EOS marker
+producer.close();  // Decrements active_producers
 ```
 
 **Consumer Side:**
 ```python
 # Python
-consumer = SharedRingBufferConsumer("buffer", 1024*1024*100)
+consumer = SharedRingBufferConsumer("buffer")
 while True:
     try:
         payload = consumer.pop()
@@ -111,7 +109,7 @@ while True:
 
 ```cpp
 // C++
-auto consumer = SharedRingBufferConsumer("buffer", 1024*1024*100);
+auto consumer = SharedRingBufferConsumer("buffer");
 while (true) {
     try {
         auto payload = consumer.pop();
@@ -135,9 +133,8 @@ while (true) {
   DeserializationFailed, InvalidMetadata, ShmNotFound, SizeMismatch
 
 **Performance Impact:**
-- EOS detection adds minimal overhead: 20 bytes read + 1 comparison per slot
-- No format changes or additional flags required
-- Early exit before reading payload when EOS detected
+- EOS detection adds minimal overhead: a header read and a comparison.
+- No additional slot markers or format changes are required.
 
 ## Object Serialization Flow
 
@@ -292,33 +289,19 @@ After Wraparound:
   (S8, S9 overwrote S2, S3 after they were consumed)
 ```
 
-## Lock-Free Synchronization
+## Synchronization (MPMC)
 
 ```
-Producer Operations:
-1. Read read_pos (consumer's position)
-2. Read write_pos (own position)
-3. Calculate available space
-4. If space available:
-   - Write slot data
-    - Update write_pos (atomic)
-5. Else:
-   - Wait (blocking) or return False (non-blocking)
+This implementation supports multiple producers and multiple consumers across
+processes.
 
-Consumer Operations:
-1. Read write_pos (producer's position)
-2. Read read_pos (own position)
-3. If data available (write_pos != read_pos):
-   - Read slot data
-    - Update read_pos (atomic)
-4. Else:
-   - Wait (blocking) or return None (non-blocking)
-
-Key Properties:
-✓ Each process only writes its own position
-✓ No locks needed (single producer, single consumer)
-✓ Memory barriers implicit in Python (GIL)
-✓ Wraparound handled transparently
+Key points:
+- A named POSIX semaphore provides cross-process mutual exclusion while updating
+    shared header fields (`write_pos`, `read_pos`, counters).
+- A second named semaphore is used as a minimal condition-like wakeup mechanism
+    for blocking waits.
+- Producers publish a slot by writing slot contents first and only then updating
+    `write_pos`.
 ```
 
 ## Object Type Examples

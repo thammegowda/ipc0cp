@@ -77,16 +77,25 @@ def consume_shm(shm_name: str) -> dict:
     Returns:
         Statistics dict with bytes_received, messages_received, elapsed_time
     """
-    # Wait a bit for producer to create shared memory
-    time.sleep(0.5)
+    # Retry attaching to shared memory (producer might not have created it yet)
+    consumer = None
+    for attempt in range(200):  # Try for up to ~20 seconds
+        try:
+            consumer = SharedRingBufferConsumer(
+                shm_name=shm_name,
+                blocking=True,
+                auto_attach=True,
+                auto_unlink=True,
+            )
+            break
+        except (FileNotFoundError, OSError):
+            if attempt < 199:
+                time.sleep(0.1)
+            else:
+                raise  # Give up after all retries
     
-    # Create consumer with 2GB buffer
-    consumer = SharedRingBufferConsumer(
-        shm_name=shm_name,
-        total_data_bytes=2 * 1024 * 1024 * 1024,  # 2 GB
-        blocking=True,
-        auto_attach=True,
-    )
+    if consumer is None:
+        raise RuntimeError(f"Failed to attach to shared memory '{shm_name}'")
     
     bytes_received = 0
     messages_received = 0

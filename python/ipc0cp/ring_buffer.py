@@ -1,9 +1,14 @@
 """ipc0cp shared-memory ring buffer.
 
-Lock-free ring buffer using POSIX shared memory for single-producer/single-consumer IPC.
+Multi-producer multi-consumer (MPMC) ring buffer using POSIX shared memory.
 
-This module implements a variable-size slot ring buffer using a hybrid linked-list approach
-with position tracking in the header for efficient lock-free operations.
+This module implements a variable-size slot ring buffer with POSIX semaphore-based
+synchronization for true multi-process support with multiple concurrent producers
+and consumers.
+
+**POSIX REQUIREMENT**: This implementation uses POSIX named semaphores for
+cross-process synchronization. It requires a POSIX-compliant platform (Linux, macOS)
+and the `posix_ipc` library. Windows is not supported.
 
 Supports generic objects with JSON metadata including:
 - NumPy arrays
@@ -18,35 +23,74 @@ import logging
 import struct
 import time
 from abc import ABC, abstractmethod
-from multiprocessing import shared_memory
 from typing import Any, Optional
 
 from .ipc import IPCError, IPCException
+from .posix_sync import (
+    PosixCondition,
+    PosixSharedMemory,
+    cleanup_buffer_semaphores,
+    get_buffer_semaphores,
+    normalize_ipc_base_name,
+)
 from .serialize import MAX_METADATA_SIZE, serialize_object, deserialize_object
 
 logger = logging.getLogger(__name__)
 
+PRODUCER_WAIT_FOR_CONSUMER_TIMEOUT_S = 60.0
+
+# Backwards-compat aliases within this module.
+_normalize_ipc_base_name = normalize_ipc_base_name
+_PosixSharedMemory = PosixSharedMemory
+_PosixCondition = PosixCondition
+_get_buffer_semaphores = get_buffer_semaphores
+_cleanup_buffer_semaphores = cleanup_buffer_semaphores
+
 
 # Constants
-HEADER_SIZE = 24  # 3 * uint64: write_pos, read_pos, total_data_bytes
+HEADER_SIZE = 64  # Extended header for MPMC: positions, counters, lock/condition
 SLOT_HEADER_SIZE = 20  # next_pos(8) + metadata_size(4) + payload_size(8)
 SENTINEL_BYTE = 0x00  # Null byte for data integrity checking (before and after payload)
 MAX_SLOT_SIZE = 10 * 1024 * 1024  # 10 MB
 DEFAULT_TOTAL_DATA_BYTES = 1 * 1024 * 1024 * 1024  # 1 GB
 
+# Header layout (64 bytes):
+# Offset 0-7:   write_pos (uint64)
+# Offset 8-15:  read_pos (uint64)
+# Offset 16-23: total_data_bytes (uint64)
+# Offset 24-27: active_producers (uint32)
+# Offset 28-31: active_consumers (uint32)
+# Offset 32-35: total_producers_joined (uint32)
+# Offset 36-39: total_consumers_joined (uint32)
+# Offset 40-63: reserved (24 bytes)
+
+
+class HeaderOffset:
+    """Byte offsets for header fields."""
+    WRITE_POS = 0
+    READ_POS = 8
+    TOTAL_DATA_BYTES = 16
+    ACTIVE_PRODUCERS = 24
+    ACTIVE_CONSUMERS = 28
+    TOTAL_PRODUCERS_JOINED = 32
+    TOTAL_CONSUMERS_JOINED = 36
+    RESERVED = 40
+
 
 class SharedRingBufferBase(ABC):
     """
-    Lock-free ring buffer for variable-size generic objects using shared memory.
+    Multi-producer multi-consumer (MPMC) ring buffer for variable-size generic objects.
     
-    Uses a hybrid linked-list approach where:
-    - Header contains write_pos and read_pos (absolute positions) for O(1) space checking
-    - Each slot contains next_pos pointer for sequential traversal
-    - Single producer writes at write_pos
-    - Single consumer reads at read_pos
+    Uses lock-based synchronization where:
+    - Header contains write_pos, read_pos, and active producer/consumer counts
+    - Named POSIX semaphores provide cross-process locking
+    - Condition variables enable efficient blocking (no busy-wait)
+    - Multiple producers can push concurrently
+    - Multiple consumers can pop concurrently
     
     Memory Layout:
-        [Header: write_pos | read_pos | total_data_bytes]
+        [Header (64 bytes): write_pos | read_pos | total_data_bytes | 
+                            active_producers | active_consumers | counters | reserved]
         [Data Region: Slot0 → Slot1 → Slot2 → ...]
         
     Each Slot:
@@ -87,31 +131,87 @@ class SharedRingBufferBase(ABC):
             max_slot_size: Maximum allowed size per slot (default 10MB)
             create: If True, create new shared memory; if False, attach to existing
         """
-        self.shm_name = shm_name
+        # Normalize once so all IPC objects (shm + semaphores) share a base name.
+        self.shm_name = _normalize_ipc_base_name(shm_name)
         self.total_data_bytes = total_data_bytes
         self.blocking = blocking
         self.max_slot_size = max_slot_size
-        self.shm: Optional[shared_memory.SharedMemory] = None
+        self.shm: Optional[_PosixSharedMemory] = None
         self.last_error: Optional[str] = None  # Track last error
+        self._closed = False  # Track if already closed
+        
+        # Synchronization primitives (shared via Manager for cross-process use)
+        self.lock = None
+        self.condition = None
+        self._sync_name = f"{shm_name}_sync"  # Unique name for this buffer's sync primitives
         
         # Total shared memory size
         self.shm_size = HEADER_SIZE + total_data_bytes
     
     def _get_write_pos(self) -> int:
         """Read write_pos from header."""
-        return struct.unpack_from('<Q', self.shm.buf, 0)[0]
+        return struct.unpack_from('<Q', self.shm.buf, HeaderOffset.WRITE_POS)[0]
     
     def _set_write_pos(self, pos: int):
         """Write write_pos to header."""
-        struct.pack_into('<Q', self.shm.buf, 0, pos)
+        struct.pack_into('<Q', self.shm.buf, HeaderOffset.WRITE_POS, pos)
     
     def _get_read_pos(self) -> int:
         """Read read_pos from header."""
-        return struct.unpack_from('<Q', self.shm.buf, 8)[0]
+        return struct.unpack_from('<Q', self.shm.buf, HeaderOffset.READ_POS)[0]
     
     def _set_read_pos(self, pos: int):
         """Write read_pos to header."""
-        struct.pack_into('<Q', self.shm.buf, 8, pos)
+        struct.pack_into('<Q', self.shm.buf, HeaderOffset.READ_POS, pos)
+    
+    def _get_active_producers(self) -> int:
+        """Read active_producers count from header."""
+        return struct.unpack_from('<I', self.shm.buf, HeaderOffset.ACTIVE_PRODUCERS)[0]
+    
+    def _set_active_producers(self, count: int):
+        """Write active_producers count to header."""
+        struct.pack_into('<I', self.shm.buf, HeaderOffset.ACTIVE_PRODUCERS, count)
+    
+    def _get_active_consumers(self) -> int:
+        """Read active_consumers count from header."""
+        return struct.unpack_from('<I', self.shm.buf, HeaderOffset.ACTIVE_CONSUMERS)[0]
+    
+    def _set_active_consumers(self, count: int):
+        """Write active_consumers count to header."""
+        struct.pack_into('<I', self.shm.buf, HeaderOffset.ACTIVE_CONSUMERS, count)
+    
+    def _increment_active_producers(self) -> int:
+        """Atomically increment active_producers. Returns new count."""
+        with self.lock:
+            count = self._get_active_producers() + 1
+            self._set_active_producers(count)
+            return count
+    
+    def _decrement_active_producers(self) -> int:
+        """Atomically decrement active_producers. Returns new count."""
+        with self.lock:
+            count = max(0, self._get_active_producers() - 1)
+            self._set_active_producers(count)
+            self.condition.notify_all()  # Wake consumers waiting for data
+            return count
+    
+    def _increment_active_consumers(self) -> int:
+        """Atomically increment active_consumers. Returns new count."""
+        with self.lock:
+            count = self._get_active_consumers() + 1
+            self._set_active_consumers(count)
+            # Wake any producers waiting for a consumer to attach.
+            if self.condition is not None:
+                self.condition.notify_all()
+            return count
+    
+    def _decrement_active_consumers(self) -> int:
+        """Atomically decrement active_consumers. Returns new count."""
+        with self.lock:
+            count = max(0, self._get_active_consumers() - 1)
+            self._set_active_consumers(count)
+            self.condition.notify_all()  # Wake producers waiting for space
+            return count
     
     def _available_space(self, write_pos: int, read_pos: int) -> int:
         """
@@ -209,22 +309,37 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         total_data_bytes: int = DEFAULT_TOTAL_DATA_BYTES,
         blocking: bool = True,
         max_slot_size: int = MAX_SLOT_SIZE,
+        create_if_not_exists: bool = True,
     ):
         """
-        Initialize the producer and create shared memory.
+        Initialize the producer and create or attach to shared memory.
         
         Args:
             shm_name: Name of the POSIX shared memory segment
             total_data_bytes: Total size of the data region in bytes
             blocking: Whether to block when buffer is full
             max_slot_size: Maximum allowed size per slot (default 10MB)
+            create_if_not_exists: If True, create new shared memory or attach if exists.
+                                  If False, always try to attach to existing.
         """
         super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
-        self._create()
+        
+        if create_if_not_exists:
+            # Try to create, fallback to attach if already exists or on error
+            try:
+                self._create()
+            except (FileExistsError, IPCException, Exception) as e:
+                # Already exists, or error creating semaphores (stale resources)
+                # Try to attach instead
+                logger.debug(f"Failed to create buffer: {e}. Attempting to attach instead.")
+                self._attach_producer()
+        else:
+            # Always attach
+            self._attach_producer()
     
     def _set_write_pos(self, pos: int):
         """Write write_pos to header."""
-        struct.pack_into('<Q', self.shm.buf, 0, pos)
+        struct.pack_into('<Q', self.shm.buf, HeaderOffset.WRITE_POS, pos)
     
     def _write_with_wrap(self, start_pos: int, data: bytes) -> int:
         """
@@ -264,42 +379,79 @@ class SharedRingBufferProducer(SharedRingBufferBase):
     
     def _create(self):
         """Create new shared memory segment and initialize header."""
+        # Create new shared memory (will raise FileExistsError if already exists)
+        self.shm = _PosixSharedMemory(self.shm_name, create=True, size=self.shm_size)
+        
+        # Create POSIX semaphores for cross-process synchronization
+        self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=True)
+        
+        # Initialize header (64 bytes)
+        # Positions (24 bytes)
+        struct.pack_into('<QQQ', self.shm.buf, HeaderOffset.WRITE_POS,
+            HEADER_SIZE,  # write_pos
+            HEADER_SIZE,  # read_pos
+            self.total_data_bytes  # total_data_bytes
+        )
+        
+        # MPMC counters (16 bytes)
+        struct.pack_into('<IIII', self.shm.buf, HeaderOffset.ACTIVE_PRODUCERS,
+            0,  # active_producers
+            0,  # active_consumers
+            0,  # total_producers_joined
+            0   # total_consumers_joined
+        )
+        
+        # Reserved (24 bytes) - zero-initialize
+        struct.pack_into('24x', self.shm.buf, HeaderOffset.RESERVED)
+        
+        # Register this producer
+        self._increment_active_producers()
+        
+        logger.info(
+            f"Created shared memory '{self.shm_name}' with {self.shm_size} bytes "
+            f"({self.total_data_bytes} bytes data region, MPMC mode with POSIX semaphores)"
+        )
+    
+    def _attach_producer(self):
+        """Attach to existing shared memory as an additional producer."""
         try:
-            # Try to unlink any existing segment with the same name
+            self.shm = _PosixSharedMemory(self.shm_name, create=False)
+            
+            # Attach to existing POSIX semaphores for cross-process synchronization
             try:
-                existing = shared_memory.SharedMemory(name=self.shm_name)
-                existing.close()
-                existing.unlink()
+                self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=False)
             except FileNotFoundError:
-                pass
+                # Semaphores don't exist but shared memory does - likely crash recovery
+                logger.warning(f"Semaphores missing for buffer '{self.shm_name}'. Attempting recovery...")
+                # Try creating them (they'll be initialized fresh, which is OK for recovery)
+                self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=True)
             
-            # Create new shared memory
-            self.shm = shared_memory.SharedMemory(
-                name=self.shm_name,
-                create=True,
-                size=self.shm_size
-            )
+            # Verify size matches
+            if self.shm.size != self.shm_size:
+                raise ValueError(
+                    f"Shared memory size mismatch: expected {self.shm_size}, "
+                    f"got {self.shm.size}"
+                )
             
-            # Initialize header
-            # write_pos = HEADER_SIZE (start of data region)
-            # read_pos = HEADER_SIZE (empty buffer)
-            # total_data_bytes = configured value
-            struct.pack_into(
-                '<QQQ',
-                self.shm.buf,
-                0,
-                HEADER_SIZE,  # write_pos
-                HEADER_SIZE,  # read_pos
-                self.total_data_bytes
-            )
+            # Read total_data_bytes from header
+            _, _, stored_total = struct.unpack_from('<QQQ', self.shm.buf, HeaderOffset.WRITE_POS)
+            if stored_total != self.total_data_bytes:
+                logger.warning(
+                    f"total_data_bytes mismatch: using stored value {stored_total}"
+                )
+                self.total_data_bytes = stored_total
+                self.shm_size = HEADER_SIZE + stored_total
             
-            logger.info(
-                f"Created shared memory '{self.shm_name}' with {self.shm_size} bytes "
-                f"({self.total_data_bytes} bytes data region)"
-            )
+            # Register this producer
+            self._increment_active_producers()
             
+            logger.info(f"Producer attached to shared memory '{self.shm_name}'")
+            
+        except FileNotFoundError:
+            logger.error(f"Shared memory '{self.shm_name}' does not exist")
+            raise
         except Exception as e:
-            logger.error(f"Failed to create shared memory: {e}")
+            logger.error(f"Failed to attach producer to shared memory: {e}")
             raise
     
     def push_raw(self, metadata_json: str, payload: bytes, timeout: Optional[float] = None) -> bool:
@@ -325,40 +477,88 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         
         payload_size = len(payload)
         slot_size = SLOT_HEADER_SIZE + metadata_size + 1 + payload_size + 1
-        
-        # Wait for space if blocking
+
+        # Wait until at least one consumer is attached.
+        # This prevents producers from racing ahead and exiting before a consumer can attach.
+        # also, if no consumer ever going to read content, do we even need to work hard and waste cycles?
+        consumer_wait_timeout = PRODUCER_WAIT_FOR_CONSUMER_TIMEOUT_S if timeout is None else timeout
         start_time = time.time()
         while True:
-            write_pos = self._get_write_pos()
-            read_pos = self._get_read_pos()
-            available = self._available_space(write_pos, read_pos)
-            
-            if available >= slot_size:
-                break
-            
-            if not self.blocking:
-                return False
-            
-            if timeout is not None and (time.time() - start_time) >= timeout:
-                return False
-            
-            time.sleep(0.0005)
+            with self.lock:
+                if self._get_active_consumers() >= 1:
+                    break
+
+                # Non-blocking producers should fail fast when no consumers are attached.
+                if not self.blocking:
+                    raise IPCException(IPCError.NO_CONSUMERS, "No active consumers")
+
+                elapsed = time.time() - start_time
+                remaining = consumer_wait_timeout - elapsed
+                if remaining <= 0:
+                    raise IPCException(
+                        IPCError.NO_CONSUMERS,
+                        f"Timed out after {consumer_wait_timeout:.1f}s waiting for a consumer to attach"
+                    )
+
+                # Wait briefly; consumer attach will notify.
+                self.condition.wait(timeout=min(0.01, remaining))
         
-        # Write slot
-        next_pos = write_pos + slot_size
-        next_pos = self._normalize_pos(next_pos)
-        
-        current_pos = write_pos
-        current_pos = self._write_uint64(current_pos, next_pos)
-        current_pos = self._write_uint32(current_pos, metadata_size)
-        current_pos = self._write_uint64(current_pos, payload_size)
-        current_pos = self._write_with_wrap(current_pos, metadata_bytes)
-        current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
-        current_pos = self._write_with_wrap(current_pos, payload)
-        current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
-        
-        self._set_write_pos(next_pos)
-        return True
+        # Wait for space if blocking (use condition variable)
+        start_time = time.time()
+        while True:
+            with self.lock:
+                write_pos = self._get_write_pos()
+                read_pos = self._get_read_pos()
+                available = self._available_space(write_pos, read_pos)
+                
+                if available >= slot_size:
+                    # Reserve slot by updating write_pos atomically
+                    next_pos = write_pos + slot_size
+                    next_pos = self._normalize_pos(next_pos)
+                    
+                    # Write slot data BEFORE updating write_pos (prevents consumers from reading partial data)
+                    current_pos = write_pos
+                    current_pos = self._write_uint64(current_pos, next_pos)
+                    current_pos = self._write_uint32(current_pos, metadata_size)
+                    current_pos = self._write_uint64(current_pos, payload_size)
+                    current_pos = self._write_with_wrap(current_pos, metadata_bytes)
+                    current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
+                    current_pos = self._write_with_wrap(current_pos, payload)
+                    current_pos = self._write_with_wrap(current_pos, bytes([SENTINEL_BYTE]))
+                    
+                    # Now update write_pos to make data visible to consumers
+                    self._set_write_pos(next_pos)
+                    
+                    # Notify consumers that data is available
+                    self.condition.notify_all()
+                    
+                    return True
+                
+                # Check if no consumers (and buffer full)
+                active_consumers = self._get_active_consumers()
+                if active_consumers == 0:
+                    # No consumers means the buffer cannot drain; respect timeout if provided.
+                    if timeout is None:
+                        raise IPCException(
+                            IPCError.NO_CONSUMERS,
+                            "Buffer full and no active consumers"
+                        )
+                
+                if not self.blocking:
+                    return False
+                
+                if timeout is not None and (time.time() - start_time) >= timeout:
+                    return False
+            
+            # Wait for space (releases lock while waiting)
+            with self.lock:
+                wait_timeout = 0.001  # 1ms
+                if timeout is not None:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        return False
+                    wait_timeout = min(wait_timeout, remaining)
+                self.condition.wait(timeout=wait_timeout)
     
     def available_space(self) -> int:
         """
@@ -424,22 +624,56 @@ class SharedRingBufferProducer(SharedRingBufferBase):
     
     def close(self):
         """
-        Close the producer by sending end-of-stream marker and closing shared memory.
+        Close the producer and unregister from active producers.
         
-        The end-of-stream marker is a slot with metadata_size=0 and payload_size=0,
-        which signals the consumer to stop reading.
+        Decrements active_producers counter and notifies waiting consumers.
+        Last producer does NOT unlink shared memory (consumers handle cleanup).
         """
-        if self.shm is not None:
-            # Push end-of-stream marker (empty metadata + empty payload)
+        if self.shm is not None and not self._closed:
+            # Unregister this producer
             try:
-                self.push_raw("", b"", timeout=5.0)
-                logger.info("Sent end-of-stream marker")
+                remaining = self._decrement_active_producers()
+                logger.info(f"Producer closed, {remaining} active producers remaining")
             except Exception as e:
-                logger.warning(f"Failed to send end-of-stream marker: {e}")
+                logger.warning(f"Failed to decrement active_producers: {e}")
             
-            # Close shared memory
+            # Close semaphores (but don't unlink - consumers will handle that)
+            try:
+                if hasattr(self, 'condition') and self.condition is not None:
+                    if not self.condition._closed:
+                        if hasattr(self.condition, 'mutex') and self.condition.mutex is not None:
+                            self.condition.mutex.close()
+                        if hasattr(self.condition, 'wait_sem') and self.condition.wait_sem is not None:
+                            self.condition.wait_sem.close()
+                        self.condition._closed = True
+            except Exception as e:
+                logger.debug(f"Error closing semaphores (may already be closed): {e}")
+            
+            # Close shared memory (but don't unlink - let consumers clean up)
             self.shm.close()
+            self._closed = True
             logger.info(f"Closed shared memory '{self.shm_name}'")
+
+    def unlink(self):
+        """Producers must not unlink shared memory.
+
+        Shared memory and semaphores are owned/cleaned by the last consumer.
+        """
+        logger.warning(
+            "Producer.unlink() ignored for '%s'; last consumer owns cleanup",
+            self.shm_name,
+        )
+    
+    def __del__(self):
+        """Ensure producer unregisters on destruction."""
+        try:
+            # Check if attributes exist (might not if __init__ failed)
+            if hasattr(self, '_closed') and self._closed:
+                return
+            if hasattr(self, 'shm') and self.shm is not None:
+                self._decrement_active_producers()
+        except:
+            pass  # Ignore errors during cleanup
 
 
 class SharedRingBufferConsumer(SharedRingBufferBase):
@@ -454,7 +688,6 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
     def __init__(
         self,
         shm_name: str,
-        total_data_bytes: int = DEFAULT_TOTAL_DATA_BYTES,
         blocking: bool = True,
         max_slot_size: int = MAX_SLOT_SIZE,
         auto_attach: bool = True,
@@ -465,13 +698,14 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         
         Args:
             shm_name: Name of the POSIX shared memory segment
-            total_data_bytes: Total size of the data region in bytes (should match producer)
             blocking: Whether to block when buffer is empty
             max_slot_size: Maximum allowed size per slot (default 10MB)
             auto_attach: If True, automatically attach to shared memory in constructor
             auto_unlink: If True, automatically unlink (delete) shared memory when EOS is received
         """
-        super().__init__(shm_name, total_data_bytes, blocking, max_slot_size)
+        # total_data_bytes is stored in the shared memory header; consumers always
+        # auto-detect it during attach.
+        super().__init__(shm_name, 0, blocking, max_slot_size)
         self.eos_received = False  # Track if end-of-stream was received
         self.auto_unlink = auto_unlink
         if auto_attach:
@@ -479,7 +713,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
     
     def _set_read_pos(self, pos: int):
         """Write read_pos to header."""
-        struct.pack_into('<Q', self.shm.buf, 8, pos)
+        struct.pack_into('<Q', self.shm.buf, HeaderOffset.READ_POS, pos)
     
     def _read_uint64(self, pos: int) -> int:
         """Read a uint64 value handling wraparound."""
@@ -511,25 +745,36 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         return self._normalize_pos(new_pos)
     
     def _attach(self):
-        """Attach to existing shared memory segment."""
+        """Attach to existing shared memory segment and synchronization primitives."""
         try:
-            self.shm = shared_memory.SharedMemory(name=self.shm_name)
+            self.shm = _PosixSharedMemory(self.shm_name, create=False)
             
-            # Verify size matches
-            if self.shm.size != self.shm_size:
+            # Attach to existing POSIX semaphores for cross-process synchronization
+            self.lock, self.condition = _get_buffer_semaphores(self.shm_name, create=False)
+
+            if self.shm.size < HEADER_SIZE:
+                raise ValueError(f"Shared memory too small: got {self.shm.size}")
+
+            # Read total_data_bytes from header and validate against the actual SHM size.
+            _, _, stored_total = struct.unpack_from('<QQQ', self.shm.buf, HeaderOffset.WRITE_POS)
+            if stored_total <= 0:
+                raise ValueError("Invalid total_data_bytes in header")
+
+            expected_shm_size = HEADER_SIZE + int(stored_total)
+            if self.shm.size != expected_shm_size:
                 raise ValueError(
-                    f"Shared memory size mismatch: expected {self.shm_size}, "
-                    f"got {self.shm.size}"
+                    f"Shared memory size mismatch: expected {expected_shm_size}, got {self.shm.size}"
                 )
-            
-            # Read total_data_bytes from header
-            _, _, stored_total = struct.unpack_from('<QQQ', self.shm.buf, 0)
-            if stored_total != self.total_data_bytes:
+
+            if self.total_data_bytes not in (0, int(stored_total)):
                 logger.warning(
                     f"total_data_bytes mismatch: using stored value {stored_total}"
                 )
-                self.total_data_bytes = stored_total
-                self.shm_size = HEADER_SIZE + stored_total
+            self.total_data_bytes = int(stored_total)
+            self.shm_size = expected_shm_size
+            
+            # Register this consumer
+            self._increment_active_consumers()
             
             logger.info(f"Attached to shared memory '{self.shm_name}'")
             
@@ -548,7 +793,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             timeout: Maximum time to wait in seconds (None = infinite if blocking)
             
         Returns:
-            Deserialized object, or None if end-of-stream marker received
+            Deserialized object, or None if no more data (all producers finished)
             
         Raises:
             IPCException: With error_type indicating the specific error
@@ -557,28 +802,54 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         if self.shm is None:
             raise IPCException(IPCError.NOT_INITIALIZED)
         
-        # Wait for data if blocking
+        # Wait for data if blocking (use condition variable)
         start_time = time.time()
-        while True:
-            write_pos = self._get_write_pos()
-            read_pos = self._get_read_pos()
-            
-            if write_pos != read_pos:
-                break
-            
-            if not self.blocking:
-                raise IPCException(IPCError.BUFFER_EMPTY)
-            
-            if timeout is not None and (time.time() - start_time) >= timeout:
-                raise IPCException(IPCError.TIMEOUT, f"Timeout after {timeout} seconds")
-            
-            time.sleep(0.0005)  # 500 microseconds
+        read_pos = None
+        next_pos = None
         
-        # Read slot at read_pos
+        while True:
+            with self.lock:
+                write_pos = self._get_write_pos()
+                current_read_pos = self._get_read_pos()
+                
+                # Check if data available
+                if write_pos != current_read_pos:
+                    # Reserve slot by reading next_pos and updating read_pos atomically
+                    read_pos = current_read_pos  # Save the position we'll read from
+                    temp_pos = current_read_pos
+                    next_pos = self._read_uint64(temp_pos)  # Read where this slot ends
+                    self._set_read_pos(next_pos)  # Reserve by moving read_pos forward
+                    break  # Exit with slot reserved
+                
+                # No data available - check if all producers finished
+                active_producers = self._get_active_producers()
+                if active_producers == 0:
+                    # All producers finished and buffer empty - graceful exit
+                    self.eos_received = True
+                    logger.info("All producers finished, buffer empty")
+                    return None
+                
+                if not self.blocking:
+                    raise IPCException(IPCError.BUFFER_EMPTY)
+                
+                if timeout is not None and (time.time() - start_time) >= timeout:
+                    raise IPCException(IPCError.TIMEOUT, f"Timeout after {timeout} seconds")
+            
+            # Wait for data (releases lock while waiting)
+            with self.lock:
+                wait_timeout = 0.001  # 1ms
+                if timeout is not None:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        raise IPCException(IPCError.TIMEOUT)
+                    wait_timeout = min(wait_timeout, remaining)
+                self.condition.wait(timeout=wait_timeout)
+        
+        # Read slot data (slot reserved via read_pos update above)
+        # read_pos contains the original position, next_pos contains where it ends
         current_pos = read_pos
         
-        # Read next_pos (8 bytes)
-        next_pos = self._read_uint64(current_pos)
+        # Skip next_pos field (8 bytes) - we already read it
         current_pos = self._advance_pos(current_pos, 8)
         
         # Read metadata_size (4 bytes)
@@ -592,21 +863,6 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         # Read payload_size (8 bytes)
         payload_size = self._read_uint64(current_pos)
         current_pos = self._advance_pos(current_pos, 8)
-        
-        # Check for end-of-stream marker (metadata_size == 0 and payload_size == 0)
-        if metadata_size == 0 and payload_size == 0:
-            self.eos_received = True
-            logger.info("Received end-of-stream marker")
-            # Update read_pos to consume the EOS slot
-            self._set_read_pos(next_pos)
-            
-            # Auto-cleanup: unlink shared memory when EOS received
-            if self.auto_unlink:
-                self.close()
-                self.unlink()
-                logger.info("Auto-unlinked shared memory after EOS")
-            
-            return None
         
         # Read metadata JSON
         metadata_bytes = self._read_bytes(current_pos, metadata_size)
@@ -645,8 +901,62 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             self.last_error = error_msg
             raise IPCException(IPCError.DESERIALIZATION_FAILED, error_msg) from e
         
-        # Update read_pos to next_pos
-        self._set_read_pos(next_pos)
+        # Notify producers that space is available
+        with self.lock:
+            self.condition.notify_all()
         
         return obj
+    
+    def close(self):
+        """
+        Close the consumer and unregister from active consumers.
+        
+        Decrements active_consumers counter and notifies waiting producers.
+        Last consumer unlinks shared memory if auto_unlink=True and cleans up semaphores.
+        """
+        if self.shm is not None and not self._closed:
+            # Unregister this consumer
+            try:
+                remaining = self._decrement_active_consumers()
+                logger.info(f"Consumer closed, {remaining} active consumers remaining")
+                
+                # Last consumer cleans up if auto_unlink enabled
+                if remaining == 0:
+                    if self.auto_unlink:
+                        self.unlink()
+                        logger.info("Last consumer unlinked shared memory")
+                    
+                    # Last consumer always cleans up semaphores
+                    _cleanup_buffer_semaphores(self.shm_name)
+                    logger.info("Last consumer cleaned up POSIX semaphores")
+            except Exception as e:
+                logger.warning(f"Failed to decrement active_consumers: {e}")
+            
+            # Close semaphores
+            try:
+                if hasattr(self, 'condition') and self.condition is not None:
+                    if not self.condition._closed:
+                        if hasattr(self.condition, 'mutex') and self.condition.mutex is not None:
+                            self.condition.mutex.close()
+                        if hasattr(self.condition, 'wait_sem') and self.condition.wait_sem is not None:
+                            self.condition.wait_sem.close()
+                        self.condition._closed = True
+            except Exception as e:
+                logger.debug(f"Error closing semaphores (may already be closed): {e}")
+            
+            # Close shared memory
+            self.shm.close()
+            self._closed = True
+            logger.info(f"Closed shared memory '{self.shm_name}'")
+    
+    def __del__(self):
+        """Ensure consumer unregisters on destruction."""
+        try:
+            # Check if attributes exist (might not if __init__ failed)
+            if hasattr(self, '_closed') and self._closed:
+                return
+            if hasattr(self, 'shm') and self.shm is not None:
+                self._decrement_active_consumers()
+        except:
+            pass  # Ignore errors during cleanup
 

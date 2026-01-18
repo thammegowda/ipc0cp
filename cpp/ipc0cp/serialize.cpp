@@ -167,6 +167,7 @@ std::unique_ptr<BytesData> BytesData::deserialize(
     const std::map<std::string, std::string>& metadata,
     const std::vector<uint8_t>& payload
 ) {
+    (void)metadata;  // unused parameter
     auto bytes_obj = std::make_unique<BytesData>();
     bytes_obj->bytes = payload;
     return bytes_obj;

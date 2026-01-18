@@ -26,7 +26,6 @@ class TestSharedRingBufferBasic:
             # Attach to same buffer
             consumer = SharedRingBufferConsumer(
                 shm_name=shm_name,
-                total_data_bytes=1024 * 1024,
             )
             
             try:
@@ -37,7 +36,6 @@ class TestSharedRingBufferBasic:
                 consumer.close()
         finally:
             producer.close()
-            producer.unlink()
     
     def test_push_pop_single_image(self):
         """Test pushing and popping a single image."""
@@ -67,7 +65,6 @@ class TestSharedRingBufferBasic:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_grayscale_image(self):
         """Test with grayscale (2D) images."""
@@ -88,7 +85,6 @@ class TestSharedRingBufferBasic:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_multiple_dtypes(self):
         """Test with different NumPy dtypes."""
@@ -119,7 +115,6 @@ class TestSharedRingBufferBasic:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
 
 
 class TestSharedRingBufferStats:
@@ -128,8 +123,8 @@ class TestSharedRingBufferStats:
     def test_get_stats(self):
         """Test get_stats method."""
         shm_name = "test_stats"
-        
         producer = SharedRingBufferProducer(shm_name=shm_name)
+        consumer = SharedRingBufferConsumer(shm_name=shm_name)
         
         try:
             # Initial stats
@@ -148,8 +143,8 @@ class TestSharedRingBufferStats:
             assert stats['used_bytes'] > 0
             assert stats['available_bytes'] < stats['total_data_bytes']
         finally:
+            consumer.close()
             producer.close()
-            producer.unlink()
 
 
 if __name__ == "__main__":

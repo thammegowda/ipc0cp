@@ -4,6 +4,7 @@ Run benchmarks comparing STDIO vs Shared Memory performance.
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import statistics
@@ -19,6 +20,54 @@ MYDIR = Path(__file__).resolve().parent
 CPP_BIN_DIR = MYDIR / 'build' / 'bin'
 
 PROCESS_TIMEOUT_GRACE_S = 10.0
+
+# All available benchmark settings (used for -s/--settings matching)
+ALL_SETTINGS = [
+    # Python baselines (single producer, single consumer)
+    'py-stdio-raw-p1-c1',
+    'py-stdio-api-p1-c1',
+    'py-shm-p1-c1',
+    
+    # C++ baselines (single producer, single consumer)
+    'cpp-stdio-p1-c1',
+    'cpp-shm-p1-c1',
+    
+    # Cross-language (single producer, single consumer)
+    'py-cpp-stdio-p1-c1',
+    'py-cpp-shm-p1-c1',
+    
+    # MPMC variants generated dynamically: {lang}-shm-p{P}-c{C}
+]
+
+
+def _parse_mpmc_scenarios(spec: str) -> List[tuple[int, int]]:
+    """Parse MPMC scenario list.
+
+    Format: comma-separated entries, each either "P×C" (e.g. "2x2") or "P:C".
+    """
+    scenarios: List[tuple[int, int]] = []
+    spec = (spec or "").strip()
+    if not spec:
+        return scenarios
+
+    for raw in spec.split(','):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if 'x' in item:
+            left, right = item.split('x', 1)
+        elif ':' in item:
+            left, right = item.split(':', 1)
+        else:
+            raise ValueError(f"Invalid MPMC scenario '{raw}'. Use like '2x2' or '2:2'.")
+
+        producers = int(left.strip())
+        consumers = int(right.strip())
+        if producers <= 0 or consumers <= 0:
+            raise ValueError(f"Invalid MPMC scenario '{raw}': counts must be > 0")
+        scenarios.append((producers, consumers))
+
+    return scenarios
 
 
 def _terminate_process(proc: subprocess.Popen) -> None:
@@ -78,6 +127,15 @@ def _run_piped(
         _terminate_process(consumer)
         raise
 
+    if producer.returncode != 0:
+        raise RuntimeError(
+            f"Producer failed (exit {producer.returncode}). Stderr:\n{producer_stderr_b.decode()}"
+        )
+    if consumer.returncode != 0:
+        raise RuntimeError(
+            f"Consumer failed (exit {consumer.returncode}). Stderr:\n{consumer_stderr_b.decode()}"
+        )
+
     return producer_stderr_b.decode(), consumer_stderr_b.decode()
 
 
@@ -133,7 +191,79 @@ def _run_two_processes(
         _terminate_process(consumer)
         raise
 
+    if producer.returncode != 0:
+        raise RuntimeError(
+            f"Producer failed (exit {producer.returncode}). Stderr:\n{producer_stderr_b.decode()}"
+        )
+    if consumer.returncode != 0:
+        raise RuntimeError(
+            f"Consumer failed (exit {consumer.returncode}). Stderr:\n{consumer_stderr_b.decode()}"
+        )
+
     return producer_stderr_b.decode(), consumer_stderr_b.decode()
+
+
+def _run_many_processes(
+    *,
+    consumer_cmds: List[List[str]],
+    producer_cmds: List[List[str]],
+    timeout_s: float,
+    cwd: Path,
+    consumer_first: bool = True,
+    startup_delay_s: float = 0.1,
+) -> tuple[List[str], List[str]]:
+    """Run multiple consumers and producers as separate processes.
+
+    Returns:
+        (producer_stderrs, consumer_stderrs)
+    """
+
+    def _start(cmd: List[str]) -> subprocess.Popen:
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(cwd),
+        )
+
+    consumers: List[subprocess.Popen] = []
+    producers: List[subprocess.Popen] = []
+
+    try:
+        if consumer_first:
+            consumers = [_start(cmd) for cmd in consumer_cmds]
+            time.sleep(startup_delay_s)
+            producers = [_start(cmd) for cmd in producer_cmds]
+        else:
+            producers = [_start(cmd) for cmd in producer_cmds]
+            time.sleep(startup_delay_s)
+            consumers = [_start(cmd) for cmd in consumer_cmds]
+
+        producer_stderrs: List[str] = []
+        consumer_stderrs: List[str] = []
+
+        for p in producers:
+            _out, err = p.communicate(timeout=timeout_s)
+            producer_stderrs.append(err.decode())
+            if p.returncode != 0:
+                raise RuntimeError(
+                    f"Producer failed (exit {p.returncode}). Stderr:\n{producer_stderrs[-1]}"
+                )
+        for c in consumers:
+            _out, err = c.communicate(timeout=timeout_s)
+            consumer_stderrs.append(err.decode())
+            if c.returncode != 0:
+                raise RuntimeError(
+                    f"Consumer failed (exit {c.returncode}). Stderr:\n{consumer_stderrs[-1]}"
+                )
+
+        return producer_stderrs, consumer_stderrs
+    except subprocess.TimeoutExpired:
+        for p in producers:
+            _terminate_process(p)
+        for c in consumers:
+            _terminate_process(c)
+        raise
 
 
 def _stats_from_stderr(producer_stderr: str, consumer_stderr: str) -> Dict:
@@ -146,6 +276,37 @@ def _stats_from_stderr(producer_stderr: str, consumer_stderr: str) -> Dict:
         'consumer_bytes': consumer_stats['bytes'],
         'producer_messages': producer_stats['messages'],
         'consumer_messages': consumer_stats['messages'],
+        'producer_elapsed_s': producer_stats.get('elapsed_s', 0.0),
+        'consumer_elapsed_s': consumer_stats.get('elapsed_s', 0.0),
+    }
+
+
+def _aggregate_stats_from_stderr_list(stderrs: List[str]) -> Dict[str, float]:
+    parsed = [parse_stats(s) for s in stderrs]
+    total_bytes = sum(p.get('bytes', 0) for p in parsed)
+    total_messages = sum(p.get('messages', 0) for p in parsed)
+    elapsed_s = max((p.get('elapsed_s', 0.0) for p in parsed), default=0.0)
+    throughput_mbps = (total_bytes / (1024.0 * 1024.0)) / elapsed_s if elapsed_s > 0 else 0.0
+    return {
+        'bytes': float(total_bytes),
+        'messages': float(total_messages),
+        'elapsed_s': float(elapsed_s),
+        'throughput_mbps': float(throughput_mbps),
+    }
+
+
+def _stats_from_many_stderr(producer_stderrs: List[str], consumer_stderrs: List[str]) -> Dict:
+    producer = _aggregate_stats_from_stderr_list(producer_stderrs)
+    consumer = _aggregate_stats_from_stderr_list(consumer_stderrs)
+    return {
+        'producer_throughput_mbps': producer['throughput_mbps'],
+        'consumer_throughput_mbps': consumer['throughput_mbps'],
+        'producer_bytes': int(producer['bytes']),
+        'consumer_bytes': int(consumer['bytes']),
+        'producer_messages': int(producer['messages']),
+        'consumer_messages': int(consumer['messages']),
+        'producer_elapsed_s': producer['elapsed_s'],
+        'consumer_elapsed_s': consumer['elapsed_s'],
     }
 
 
@@ -158,7 +319,6 @@ class Variant:
 
 def get_cpp_executable(name: str) -> Path:
     """Get the requested C++ benchmark binary, raising if it is missing."""
-
     exe = CPP_BIN_DIR / name
     if sys.platform == 'win32':
         exe = exe.with_suffix('.exe')
@@ -168,77 +328,6 @@ def get_cpp_executable(name: str) -> Path:
             f"Build it with `cmake -S {MYDIR} -B {MYDIR / 'build'}`."
         )
     return exe
-def run_shm_benchmark(duration: float, min_size: int, max_size: int) -> Dict:
-    """
-    Run shared memory benchmark.
-    
-    Args:
-        duration: Duration in seconds
-        min_size: Minimum payload size
-        max_size: Maximum payload size
-        
-    Returns:
-        Dict with throughput_mbps
-    """
-    timeout_s = duration + PROCESS_TIMEOUT_GRACE_S
-    shm_name = f"bench_{os.getpid()}_{int(time.time() * 1000)}"
-    
-    producer_cmd = [
-        sys.executable,
-        'producer.py',
-        '--shm', shm_name,
-        '--duration', str(duration),
-        '--min-size', str(min_size),
-        '--max-size', str(max_size),
-        '--quiet',
-    ]
-    
-    consumer_cmd = [
-        sys.executable,
-        'consumer.py',
-        '--shm', shm_name,
-        '--quiet',
-    ]
-    
-    # Start consumer first (it will wait for shared memory)
-    consumer = subprocess.Popen(
-        consumer_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=os.path.dirname(__file__),
-    )
-    
-    # Small delay then start producer
-    time.sleep(0.1)
-    
-    producer = subprocess.Popen(
-        producer_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=os.path.dirname(__file__),
-    )
-    
-    # Wait for both to finish (bounded)
-    try:
-        producer_stdout, producer_stderr = producer.communicate(timeout=timeout_s)
-        consumer_stdout, consumer_stderr = consumer.communicate(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        _terminate_process(producer)
-        _terminate_process(consumer)
-        raise
-    
-    # Parse throughput from stderr output
-    producer_stats = parse_stats(producer_stderr.decode())
-    consumer_stats = parse_stats(consumer_stderr.decode())
-    
-    return {
-        'producer_throughput_mbps': producer_stats['throughput_mbps'],
-        'consumer_throughput_mbps': consumer_stats['throughput_mbps'],
-        'producer_bytes': producer_stats['bytes'],
-        'consumer_bytes': consumer_stats['bytes'],
-        'producer_messages': producer_stats['messages'],
-        'consumer_messages': consumer_stats['messages'],
-    }
 
 
 def parse_stats(stderr_output: str) -> Dict:
@@ -255,6 +344,7 @@ def parse_stats(stderr_output: str) -> Dict:
         'bytes': 0,
         'messages': 0,
         'throughput_mbps': 0.0,
+        'elapsed_s': 0.0,
     }
     
     for line in stderr_output.split('\n'):
@@ -268,6 +358,13 @@ def parse_stats(stderr_output: str) -> Dict:
         elif 'Throughput:' in line:
             parts = line.split(':', 1)[1].strip().split()
             stats['throughput_mbps'] = float(parts[0])
+        elif 'Elapsed time:' in line:
+            parts = line.split(':', 1)[1].strip().split()
+            # Usually: "<seconds> seconds"
+            try:
+                stats['elapsed_s'] = float(parts[0])
+            except Exception:
+                pass
     
     return stats
 
@@ -305,7 +402,8 @@ def _build_variants(
     duration: float,
     min_size: int,
     max_size: int,
-    include_cpp: bool,
+    mpmc_scenarios: List[tuple[int, int]],
+    skip_cpp: bool = False,
 ) -> List[Variant]:
     timeout_s = duration + PROCESS_TIMEOUT_GRACE_S
 
@@ -334,8 +432,8 @@ def _build_variants(
         )
         return _stats_from_stderr(producer_stderr, consumer_stderr)
 
-    variants.append(Variant('stdio_raw', 'Python STDIO (raw)', lambda: py_piped('--stdio')))
-    variants.append(Variant('stdio_api', 'Python STDIO (API)', lambda: py_piped('--stdio-api')))
+    variants.append(Variant('py-stdio-raw-p1-c1', 'Python STDIO (raw)', lambda: py_piped('--stdio')))
+    variants.append(Variant('py-stdio-api-p1-c1', 'Python STDIO (API)', lambda: py_piped('--stdio-api')))
 
     def py_shm() -> Dict:
         shm_name = f"bench_{os.getpid()}_{int(time.time() * 1000)}"
@@ -360,9 +458,49 @@ def _build_variants(
         )
         return _stats_from_stderr(producer_stderr, consumer_stderr)
 
-    variants.append(Variant('shm', 'Python Shared Memory', py_shm))
+    variants.append(Variant('py-shm-p1-c1', 'Python Shared Memory', py_shm))
 
-    if not include_cpp:
+    # Python SHM MPMC scenarios (separate processes, aggregate stats)
+    for producers, consumers in mpmc_scenarios:
+        key = f"py-shm-p{producers}-c{consumers}"
+        label = f"Python Shared Memory MPMC (P={producers}, C={consumers})"
+
+        def _mk_py_mpmc_run(p: int, c: int) -> Callable[[], Dict]:
+            def _run() -> Dict:
+                shm_name = f"bench_mpmc_py_p{p}_c{c}_{os.getpid()}_{int(time.time() * 1000)}"
+                prod_stderrs, cons_stderrs = _run_many_processes(
+                    consumer_cmds=[
+                        [sys.executable, 'consumer.py', '--shm', shm_name, '--quiet']
+                        for _ in range(c)
+                    ],
+                    producer_cmds=[
+                        [
+                            sys.executable,
+                            'producer.py',
+                            '--shm',
+                            shm_name,
+                            '--duration',
+                            str(duration),
+                            '--min-size',
+                            str(min_size),
+                            '--max-size',
+                            str(max_size),
+                            '--quiet',
+                        ]
+                        for _ in range(p)
+                    ],
+                    timeout_s=timeout_s,
+                    cwd=MYDIR,
+                    consumer_first=True,
+                    startup_delay_s=0.1,
+                )
+                return _stats_from_many_stderr(prod_stderrs, cons_stderrs)
+
+            return _run
+
+        variants.append(Variant(key, label, _mk_py_mpmc_run(producers, consumers)))
+
+    if skip_cpp:
         return variants
 
     cpp_producer = get_cpp_executable('cpp_producer')
@@ -387,7 +525,7 @@ def _build_variants(
         )
         return _stats_from_stderr(producer_stderr, consumer_stderr)
 
-    variants.append(Variant('cpp_stdio', 'C++ STDIO (API)', cpp_stdio))
+    variants.append(Variant('cpp-stdio-p1-c1', 'C++ STDIO (API)', cpp_stdio))
 
     def cpp_shm() -> Dict:
         shm_name = f"bench_cpp_{os.getpid()}_{int(time.time() * 1000)}"
@@ -410,7 +548,46 @@ def _build_variants(
         )
         return _stats_from_stderr(producer_stderr, consumer_stderr)
 
-    variants.append(Variant('cpp_shm', 'C++ Shared Memory', cpp_shm))
+    variants.append(Variant('cpp-shm-p1-c1', 'C++ Shared Memory', cpp_shm))
+
+    # C++ SHM MPMC scenarios
+    for producers, consumers in mpmc_scenarios:
+        key = f"cpp-shm-p{producers}-c{consumers}"
+        label = f"C++ Shared Memory MPMC (P={producers}, C={consumers})"
+
+        def _mk_cpp_mpmc_run(p: int, c: int) -> Callable[[], Dict]:
+            def _run() -> Dict:
+                shm_name = f"bench_mpmc_cpp_p{p}_c{c}_{os.getpid()}_{int(time.time() * 1000)}"
+                prod_stderrs, cons_stderrs = _run_many_processes(
+                    consumer_cmds=[
+                        [str(cpp_consumer), '--shm', shm_name, '--quiet']
+                        for _ in range(c)
+                    ],
+                    producer_cmds=[
+                        [
+                            str(cpp_producer),
+                            '--shm',
+                            shm_name,
+                            '--duration',
+                            str(duration),
+                            '--min-size',
+                            str(min_size),
+                            '--max-size',
+                            str(max_size),
+                            '--quiet',
+                        ]
+                        for _ in range(p)
+                    ],
+                    timeout_s=timeout_s,
+                    cwd=MYDIR,
+                    consumer_first=True,
+                    startup_delay_s=0.1,
+                )
+                return _stats_from_many_stderr(prod_stderrs, cons_stderrs)
+
+            return _run
+
+        variants.append(Variant(key, label, _mk_cpp_mpmc_run(producers, consumers)))
 
     # Python -> C++
     def py_cpp_stdio() -> Dict:
@@ -431,7 +608,7 @@ def _build_variants(
         )
         return _stats_from_stderr(producer_stderr, consumer_stderr)
 
-    variants.append(Variant('py_cpp_stdio', 'Python -> C++ STDIO (API)', py_cpp_stdio))
+    variants.append(Variant('py-cpp-stdio-p1-c1', 'Python -> C++ STDIO (API)', py_cpp_stdio))
 
     def py_cpp_shm() -> Dict:
         shm_name = f"bench_py_cpp_{os.getpid()}_{int(time.time() * 1000)}"
@@ -454,24 +631,106 @@ def _build_variants(
         )
         return _stats_from_stderr(producer_stderr, consumer_stderr)
 
-    variants.append(Variant('py_cpp_shm', 'Python -> C++ Shared Memory', py_cpp_shm))
+    variants.append(Variant('py-cpp-shm-p1-c1', 'Python -> C++ Shared Memory', py_cpp_shm))
+
+    # Python (multi-producer) -> C++ (single consumer) over SHM
+    # Enabled when MPMC scenarios are requested (mpmc_scenarios non-empty).
+    if mpmc_scenarios:
+        def py_cpp_shm_p4_c1() -> Dict:
+            shm_name = f"bench_py_cpp_mpmc_p4_c1_{os.getpid()}_{int(time.time() * 1000)}"
+            prod_stderrs, cons_stderrs = _run_many_processes(
+                consumer_cmds=[
+                    [str(cpp_consumer), '--shm', shm_name, '--quiet'],
+                ],
+                producer_cmds=[
+                    [
+                        sys.executable,
+                        'producer.py',
+                        '--shm',
+                        shm_name,
+                        '--duration',
+                        str(duration),
+                        '--min-size',
+                        str(min_size),
+                        '--max-size',
+                        str(max_size),
+                        '--quiet',
+                    ]
+                    for _ in range(4)
+                ],
+                timeout_s=timeout_s,
+                cwd=MYDIR,
+                consumer_first=True,
+                startup_delay_s=0.1,
+            )
+            return _stats_from_many_stderr(prod_stderrs, cons_stderrs)
+
+        variants.append(
+            Variant(
+                'py-cpp-shm-p4-c1',
+                'Python -> C++ Shared Memory MPMC (P=4, C=1)',
+                py_cpp_shm_p4_c1,
+            )
+        )
 
     return variants
 
 
+
+def mem_size(str) -> int:
+    """Parse memory size string with optional suffixes (K, M, G)."""
+    str = str.strip().upper()
+    if str.endswith('G'):
+        return int(float(str[:-1]) * 1024 * 1024 * 1024)
+    elif str.endswith('M'):
+        return int(float(str[:-1]) * 1024 * 1024)
+    elif str.endswith('K'):
+        return int(float(str[:-1]) * 1024)
+    else:
+        try:
+            return int(str)
+        except ValueError:
+            raise ValueError(f"Invalid memory size: {str}; expect integer with optional K, M, G suffix.")
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Run IPC benchmarks')
+    epilog = (
+        "Available settings:\n"
+        + "\n".join(f"  {s}" for s in ALL_SETTINGS)
+        + "\n\nUse glob patterns to select: -s 'py-*' or -s 'cpp-*' or -s 'mpmc-*'"
+        + "\nMPMC variants are generated dynamically based on --scenarios."
+    )
+    
+    parser = argparse.ArgumentParser(
+        description='Run IPC benchmarks',
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument('--runs', type=int, default=3,
                         help='Number of runs per benchmark (default: 3)')
     parser.add_argument('--duration', type=float, default=20.0,
                         help='Duration per run in seconds (default: 20)')
-    parser.add_argument('--min-size', type=int, default=512 * 1024,
-                        help='Minimum payload size in bytes (default: 512KB)')
-    parser.add_argument('--max-size', type=int, default=5 * 1024 * 1024,
-                        help='Maximum payload size in bytes (default: 5MB)')
-    # C++ benchmarks are enabled by default.
-    parser.add_argument('--no-cpp', action='store_true',
-                        help='Disable C++ benchmarks (Python-only)')
+    parser.add_argument('--min-size', type=mem_size, default=512 * 1024,
+                        help='Minimum payload size in bytes (default: 512KB); supports K, M, G suffixes')
+    parser.add_argument('--max-size', type=mem_size, default=5 * 1024 * 1024,
+                        help='Maximum payload size in bytes (default: 5MB); supports K, M, G suffixes')
+
+    parser.add_argument(
+        '-s',
+        '--settings',
+        nargs='+',
+        default=['all'],
+        help=(
+            "Which benchmark settings to run (multi-value, glob patterns supported). "
+            "Default: all. Examples: -s py-* cpp-* | -s xlang-* | -s mpmc-*"
+        ),
+    )
+
+    parser.add_argument(
+        '--scenarios',
+        type=str,
+        default='2x2,4x4',
+        help="MPMC scenarios like '2x2,4x4' (used when settings include 'mpmc' / '*-mpmc')",
+    )
 
     args = parser.parse_args()
 
@@ -481,8 +740,15 @@ def main() -> None:
     print(f"  Runs: {args.runs}")
     print(f"  Duration: {args.duration:.1f}s")
     print(f"  Payload size range: {args.min_size / 1024:.0f}KB - {args.max_size / (1024**2):.1f}MB")
-    include_cpp = not bool(args.no_cpp)
-    print(f"  Include C++: {include_cpp}")
+
+    settings_patterns = list(args.settings or ['all'])
+    if settings_patterns != ['all']:
+        print(f"  Settings: {', '.join(settings_patterns)}")
+    
+    # Always parse scenarios - MPMC variants will be built if scenarios are specified
+    mpmc_scenarios: List[tuple[int, int]] = _parse_mpmc_scenarios(args.scenarios)
+    if mpmc_scenarios:
+        print(f"  Scenarios: {args.scenarios}")
     print()
 
     try:
@@ -490,7 +756,7 @@ def main() -> None:
             duration=args.duration,
             min_size=args.min_size,
             max_size=args.max_size,
-            include_cpp=include_cpp,
+            mpmc_scenarios=mpmc_scenarios,
         )
     except FileNotFoundError as exc:
         print(f"Warning: C++ benchmark binaries missing; running Python-only. ({exc})", file=sys.stderr)
@@ -498,8 +764,39 @@ def main() -> None:
             duration=args.duration,
             min_size=args.min_size,
             max_size=args.max_size,
-            include_cpp=False,
+            mpmc_scenarios=mpmc_scenarios,
+            skip_cpp=True,
         )
+
+    # Build the actual settings list from generated variants (includes dynamic MPMC tags)
+    available_settings = sorted({v.key for v in variants})
+
+    # Expand patterns: 'all' means all, otherwise use fnmatch
+    if settings_patterns == ['all'] or 'all' in settings_patterns:
+        selected_settings = set(available_settings)
+    else:
+        selected_settings: set[str] = set()
+        for pat in settings_patterns:
+            matches = {s for s in available_settings if fnmatch.fnmatch(s, pat)}
+            if not matches:
+                raise SystemExit(
+                    f"No settings match pattern '{pat}'.\n\nAvailable settings:\n  "
+                    + "\n  ".join(available_settings)
+                )
+            selected_settings |= matches
+
+    variants = [v for v in variants if v.key in selected_settings]
+    if not variants:
+        raise SystemExit(
+            "No benchmarks selected.\n\nAvailable settings:\n  "
+            + "\n  ".join(available_settings)
+        )
+
+    # Display matched settings
+    print("Matched settings:")
+    for setting in sorted(selected_settings):
+        print(f"  {setting}")
+    print()
 
     results_by_key: Dict[str, List[Dict]] = {v.key: [] for v in variants}
     for variant in variants:
@@ -519,9 +816,9 @@ def main() -> None:
     for variant in variants:
         stats_by_key[variant.key] = summarize_variant(variant.label, results_by_key[variant.key])
 
-    stdio_raw_stats = stats_by_key.get('stdio_raw')
-    stdio_api_stats = stats_by_key.get('stdio_api')
-    shm_stats = stats_by_key.get('shm')
+    stdio_raw_stats = stats_by_key.get('py-stdio-raw-p1-c1')
+    stdio_api_stats = stats_by_key.get('py-stdio-api-p1-c1')
+    shm_stats = stats_by_key.get('py-shm-p1-c1')
 
     speedup_vs_raw = 0.0
     speedup_vs_api = 0.0
@@ -557,15 +854,21 @@ def main() -> None:
             'duration': args.duration,
             'min_size': args.min_size,
             'max_size': args.max_size,
-            'include_cpp': include_cpp,
+            'settings': settings_patterns,
+            'scenarios': args.scenarios if mpmc_scenarios else '',
         },
-        'stdio_raw': pack_entry('stdio_raw'),
-        'stdio_api': pack_entry('stdio_api'),
-        'shm': pack_entry('shm'),
-        'cpp_stdio': pack_entry('cpp_stdio'),
-        'cpp_shm': pack_entry('cpp_shm'),
-        'py_cpp_stdio': pack_entry('py_cpp_stdio'),
-        'py_cpp_shm': pack_entry('py_cpp_shm'),
+        'py-stdio-raw-p1-c1': pack_entry('py-stdio-raw-p1-c1'),
+        'py-stdio-api-p1-c1': pack_entry('py-stdio-api-p1-c1'),
+        'py-shm-p1-c1': pack_entry('py-shm-p1-c1'),
+        'cpp-stdio-p1-c1': pack_entry('cpp-stdio-p1-c1'),
+        'cpp-shm-p1-c1': pack_entry('cpp-shm-p1-c1'),
+        'py-cpp-stdio-p1-c1': pack_entry('py-cpp-stdio-p1-c1'),
+        'py-cpp-shm-p1-c1': pack_entry('py-cpp-shm-p1-c1'),
+        'mpmc': {
+            k: pack_entry(k)
+            for k in results_by_key.keys()
+            if '-p' in k and '-c' in k and not k.endswith('-p1-c1')
+        },
         'speedup_vs_stdio_raw': speedup_vs_raw,
         'speedup_vs_stdio_api': speedup_vs_api,
     }

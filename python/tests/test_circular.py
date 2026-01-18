@@ -23,7 +23,6 @@ class TestSharedRingBufferCircular:
         )
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=500 * 1024,
         )
         
         try:
@@ -43,7 +42,6 @@ class TestSharedRingBufferCircular:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
     
     def test_wraparound_during_write(self):
         """Test wraparound in the middle of writing a slot."""
@@ -56,7 +54,6 @@ class TestSharedRingBufferCircular:
         )
         consumer = SharedRingBufferConsumer(
             shm_name=shm_name,
-            total_data_bytes=100 * 1024,
         )
         
         try:
@@ -103,7 +100,6 @@ class TestSharedRingBufferCircular:
         finally:
             consumer.close()
             producer.close()
-            producer.unlink()
 
 
 if __name__ == "__main__":

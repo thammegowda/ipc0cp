@@ -30,6 +30,7 @@ keywords = ["ipc", "shared-memory", "zero-copy", "interprocess", "python", "cpp"
 dependencies = [
     "numpy>=1.20.0",
     "pillow>=9.0.0",
+    "posix_ipc>=1.0.0",
 ]
 
 [project.optional-dependencies]

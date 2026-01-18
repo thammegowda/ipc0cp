@@ -14,11 +14,12 @@ It ships two transports:
 
 ## Features
 
-- **SPSC lock-free design**: single producer + single consumer.
+- **True multi-process MPMC**: multiple producers + multiple consumers across processes.
+- **POSIX synchronization**: named semaphores + a minimal condition-like wakeup primitive.
 - **Variable-size slots**: payload sizes can vary per message.
 - **Unified wire format**: both transports use JSON metadata + binary payload framing.
 - **Generic object support**: bytes, UTF-8 text, JSON, NumPy arrays, PIL images, and heterogeneous lists via the `ListData` format (bytes, text, JSON, arrays, nested lists, etc.).
-- **EOS marker**: producers can signal a clean end-of-stream.
+- **EOS via producer liveness**: consumers return `None` when the buffer is empty and `active_producers == 0`.
 - **Blocking / non-blocking**: optional timeouts for push/pop.
 - **Data integrity checks**: sentinel bytes around payloads detect corruption/overruns.
 
@@ -58,8 +59,7 @@ producer.push(np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8))
 producer.push({"msg": "hello", "id": 123})
 producer.push(b"raw bytes")
 
-producer.close()   # sends EOS
-producer.unlink()  # delete shared memory segment
+producer.close()   # decrements active_producers
 ```
 
 Consumer (process 2):
@@ -72,7 +72,7 @@ consumer = SharedRingBufferConsumer(
     total_data_bytes=256 * 1024 * 1024,
     blocking=True,
     auto_attach=True,
-    auto_unlink=False,
+  auto_unlink=True,  # last consumer cleans shared memory + semaphores
 )
 
 while True:
@@ -82,7 +82,11 @@ while True:
     print(type(obj))
 
 consumer.close()
-consumer.unlink()  # optional cleanup
+consumer.close()  # if last consumer and auto_unlink=True, this cleans up
+
+Notes:
+- Producers wait (up to 60s) for at least one consumer to attach before pushing.
+- Producers never unlink shared memory; cleanup is owned by the last consumer.
 ```
 
 ### STDIO quickstart

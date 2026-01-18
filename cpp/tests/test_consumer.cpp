@@ -97,7 +97,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Buffer size: " << (buffer_size / (1024 * 1024)) << " MB" << std::endl;
     
     // Create consumer
-    auto consumer = SharedRingBufferConsumer(shm_name, buffer_size, true);
+        auto consumer = SharedRingBufferConsumer(shm_name);
     
     // Attach to shared memory
     std::cout << "Waiting for shared memory to be created by producer..." << std::endl;
