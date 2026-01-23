@@ -50,13 +50,13 @@ class StdioProducer:
         self.output = output_stream or sys.stdout.buffer
         self.closed = False
     
-    def push(self, obj: Any) -> bool:
+    def push(self, obj: Any, timeout: Optional[float] = None) -> bool:
         """
         Serialize and write an object to stdout.
         
         Args:
             obj: Any Python object supported by the serialization system
-        
+            timeout: Ignored for STDIO (blocking I/O only)
         Returns:
             True on success
             
