@@ -785,12 +785,16 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             logger.error(f"Failed to attach to shared memory: {e}")
             raise
     
-    def pop(self, timeout: Optional[float] = None) -> Optional[Any]:
+    def pop(self, timeout: Optional[float] = None, copy: bool = False) -> Optional[Any]:
         """
         Pop an object from the ring buffer (consumer operation).
         
         Args:
             timeout: Maximum time to wait in seconds (None = infinite if blocking)
+            copy: If True, copy all slot data while holding the lock before
+                  advancing read_pos.  Prevents producers from overwriting
+                  the slot during read.  Required for MPMC with high
+                  producer counts where the buffer wraps frequently.
             
         Returns:
             Deserialized object, or None if no more data (all producers finished)
@@ -806,6 +810,7 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
         start_time = time.time()
         read_pos = None
         next_pos = None
+        slot_snapshot = None  # local copy of slot bytes when copy=True
         
         while True:
             with self.lock:
@@ -814,17 +819,26 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
                 
                 # Check if data available
                 if write_pos != current_read_pos:
-                    # Reserve slot by reading next_pos and updating read_pos atomically
-                    read_pos = current_read_pos  # Save the position we'll read from
-                    temp_pos = current_read_pos
-                    next_pos = self._read_uint64(temp_pos)  # Read where this slot ends
-                    self._set_read_pos(next_pos)  # Reserve by moving read_pos forward
-                    break  # Exit with slot reserved
+                    read_pos = current_read_pos
+                    next_pos = self._read_uint64(current_read_pos)
+
+                    if copy:
+                        # Copy entire slot into local memory BEFORE freeing
+                        # the region.  This prevents producers from overwriting
+                        # data while we parse it outside the lock.
+                        end_of_region = HEADER_SIZE + self.total_data_bytes
+                        if next_pos >= read_pos:
+                            slot_len = next_pos - read_pos
+                        else:
+                            slot_len = (end_of_region - read_pos) + (next_pos - HEADER_SIZE)
+                        slot_snapshot = self._read_bytes(read_pos, slot_len)
+
+                    self._set_read_pos(next_pos)
+                    break
                 
                 # No data available - check if all producers finished
                 active_producers = self._get_active_producers()
                 if active_producers == 0:
-                    # All producers finished and buffer empty - graceful exit
                     self.eos_received = True
                     logger.info("All producers finished, buffer empty")
                     return None
@@ -845,53 +859,58 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
                     wait_timeout = min(wait_timeout, remaining)
                 self.condition.wait(timeout=wait_timeout)
         
-        # Read slot data (slot reserved via read_pos update above)
-        # read_pos contains the original position, next_pos contains where it ends
-        current_pos = read_pos
-        
-        # Skip next_pos field (8 bytes) - we already read it
-        current_pos = self._advance_pos(current_pos, 8)
-        
-        # Read metadata_size (4 bytes)
-        metadata_size = self._read_uint32(current_pos)
-        current_pos = self._advance_pos(current_pos, 4)
-        
-        # Validate metadata size
-        if metadata_size > MAX_METADATA_SIZE:
-            raise ValueError(f"Invalid metadata_size: {metadata_size}")
-        
-        # Read payload_size (8 bytes)
-        payload_size = self._read_uint64(current_pos)
-        current_pos = self._advance_pos(current_pos, 8)
-        
-        # Read metadata JSON
-        metadata_bytes = self._read_bytes(current_pos, metadata_size)
-        current_pos = self._advance_pos(current_pos, metadata_size)
-        
-        # Parse metadata
-        try:
-            metadata_str = metadata_bytes.decode('utf-8')
-        except Exception as e:
-            raise ValueError(f"Failed to parse metadata JSON: {e}")
-        
-        # Read and verify start sentinel
-        start_sentinel = self._read_bytes(current_pos, 1)
-        if len(start_sentinel) != 1 or start_sentinel[0] != SENTINEL_BYTE:
-            error_msg = f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})"
-            self.last_error = error_msg
-            raise IPCException(IPCError.CORRUPT_PAYLOAD, error_msg)
-        current_pos = self._advance_pos(current_pos, 1)
-        
-        # Read payload
-        payload = self._read_bytes(current_pos, payload_size)
-        current_pos = self._advance_pos(current_pos, payload_size)
-        
-        # Read and verify end sentinel
-        end_sentinel = self._read_bytes(current_pos, 1)
-        if len(end_sentinel) != 1 or end_sentinel[0] != SENTINEL_BYTE:
-            error_msg = f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})"
-            self.last_error = error_msg
-            raise IPCException(IPCError.CORRUPT_PAYLOAD, error_msg)
+        # ── Parse slot data ──────────────────────────────────────────
+        if slot_snapshot is not None:
+            # Safe path: parse from local copy
+            off = 8  # skip next_pos (already read)
+            metadata_size = struct.unpack_from('<I', slot_snapshot, off)[0]
+            off += 4
+            if metadata_size > MAX_METADATA_SIZE:
+                raise ValueError(f"Invalid metadata_size: {metadata_size}")
+            payload_size = struct.unpack_from('<Q', slot_snapshot, off)[0]
+            off += 8
+            metadata_bytes = slot_snapshot[off:off + metadata_size]
+            off += metadata_size
+            try:
+                metadata_str = metadata_bytes.decode('utf-8')
+            except Exception as e:
+                raise ValueError(f"Failed to parse metadata JSON: {e}")
+            if slot_snapshot[off] != SENTINEL_BYTE:
+                raise IPCException(IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {slot_snapshot[off]})")
+            off += 1
+            payload = slot_snapshot[off:off + payload_size]
+            off += payload_size
+            if slot_snapshot[off] != SENTINEL_BYTE:
+                raise IPCException(IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {slot_snapshot[off]})")
+        else:
+            # Original zero-copy path: read directly from SHM
+            current_pos = read_pos
+            current_pos = self._advance_pos(current_pos, 8)
+            metadata_size = self._read_uint32(current_pos)
+            current_pos = self._advance_pos(current_pos, 4)
+            if metadata_size > MAX_METADATA_SIZE:
+                raise ValueError(f"Invalid metadata_size: {metadata_size}")
+            payload_size = self._read_uint64(current_pos)
+            current_pos = self._advance_pos(current_pos, 8)
+            metadata_bytes = self._read_bytes(current_pos, metadata_size)
+            current_pos = self._advance_pos(current_pos, metadata_size)
+            try:
+                metadata_str = metadata_bytes.decode('utf-8')
+            except Exception as e:
+                raise ValueError(f"Failed to parse metadata JSON: {e}")
+            start_sentinel = self._read_bytes(current_pos, 1)
+            if len(start_sentinel) != 1 or start_sentinel[0] != SENTINEL_BYTE:
+                raise IPCException(IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {start_sentinel[0] if start_sentinel else 'empty'})")
+            current_pos = self._advance_pos(current_pos, 1)
+            payload = self._read_bytes(current_pos, payload_size)
+            current_pos = self._advance_pos(current_pos, payload_size)
+            end_sentinel = self._read_bytes(current_pos, 1)
+            if len(end_sentinel) != 1 or end_sentinel[0] != SENTINEL_BYTE:
+                raise IPCException(IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {end_sentinel[0] if end_sentinel else 'empty'})")
         
         # Deserialize using metadata_str and payload
         try:
