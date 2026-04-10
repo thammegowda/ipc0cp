@@ -562,4 +562,111 @@ std::unique_ptr<SerializableObject> deserialize(
     return SerializableObject::deserialize(metadata_map, payload);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Zero-copy deserialize: objects borrow data from shared payload
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// Recursive zero-copy deserialize helper.
+// For BytesData-derived types, creates view-mode objects pointing into payload.
+// For ListData, recursively deserializes items with views.
+std::unique_ptr<SerializableObject> deserialize_zero_copy(
+    const std::string& metadata_json,
+    std::shared_ptr<const std::vector<uint8_t>> payload,
+    size_t offset, size_t length
+) {
+    using json = nlohmann::json;
+    auto metadata = json::parse(metadata_json);
+    auto type_str = metadata.value("type", "unknown");
+
+    if (type_str == "list") {
+        size_t count = metadata.value("count", size_t(0));
+        auto items_array = metadata.value("items", json::array());
+        if (items_array.size() != count) {
+            throw std::runtime_error("Zero-copy deserialize: list count mismatch");
+        }
+
+        std::vector<std::unique_ptr<SerializableObject>> items_vec;
+        items_vec.reserve(count);
+        size_t item_offset = offset;
+
+        for (size_t i = 0; i < count; ++i) {
+            auto& entry = items_array[i];
+            size_t payload_size = entry.value("payload_size", size_t(0));
+            auto item_meta = entry.value("metadata", json::object());
+            std::string item_meta_json = item_meta.dump();
+
+            auto item = deserialize_zero_copy(item_meta_json, payload, item_offset, payload_size);
+            items_vec.push_back(std::move(item));
+            item_offset += payload_size;
+        }
+
+        return std::make_unique<ListData>(std::move(items_vec));
+    }
+
+    // BytesData-derived types: create view into payload
+    const uint8_t* ptr = payload->data() + offset;
+
+    if (type_str == "ndarray" || type_str == "numpy") {
+        auto arr = std::make_unique<NumpyArray>();
+        arr->payload_ref = payload;
+        arr->view_ptr = ptr;
+        arr->view_size = length;
+        arr->dtype = metadata.value("dtype", "uint8");
+        auto shape_str = metadata.value("shape", "[]");
+        arr->shape = SerializerUtils::parse_shape(shape_str);
+        return arr;
+    }
+
+    if (type_str == "json") {
+        auto obj = std::make_unique<JsonData>();
+        obj->payload_ref = payload;
+        obj->view_ptr = ptr;
+        obj->view_size = length;
+        if (length > 0) {
+            obj->text = std::string(reinterpret_cast<const char*>(ptr), length);
+        }
+        return obj;
+    }
+
+    if (type_str == "text") {
+        auto obj = std::make_unique<TextData>();
+        obj->payload_ref = payload;
+        obj->view_ptr = ptr;
+        obj->view_size = length;
+        obj->encoding = metadata.value("encoding", "utf-8");
+        if (length > 0) {
+            obj->text = std::string(reinterpret_cast<const char*>(ptr), length);
+        }
+        return obj;
+    }
+
+    if (type_str == "image") {
+        auto obj = std::make_unique<ImageData>();
+        obj->payload_ref = payload;
+        obj->view_ptr = ptr;
+        obj->view_size = length;
+        obj->mode = metadata.value("mode", "RGB");
+        auto size_str = metadata.value("size", "[0,0]");
+        auto [w, h] = SerializerUtils::parse_size(size_str);
+        obj->width = w;
+        obj->height = h;
+        return obj;
+    }
+
+    // Fallback: generic BytesData view
+    auto obj = std::make_unique<BytesData>(payload, ptr, length);
+    return obj;
+}
+
+} // anonymous namespace
+
+std::unique_ptr<SerializableObject> deserialize(
+    const std::string& metadata_json,
+    std::shared_ptr<const std::vector<uint8_t>> payload
+) {
+    return deserialize_zero_copy(metadata_json, std::move(payload), 0, payload->size());
+}
+
 } // namespace ipc0cp

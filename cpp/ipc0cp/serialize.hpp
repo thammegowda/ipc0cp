@@ -85,21 +85,45 @@ public:
 };
 
 /**
- * @brief Raw bytes - base class for all data types
- * All serializable objects are fundamentally bytes with interpretation
+ * @brief Raw bytes - base class for all data types.
+ *
+ * Supports two modes:
+ * - **Owning**: `bytes` vector holds the data (default, from construction/copy).
+ * - **View**: data points into a shared payload buffer (zero-copy deserialization).
+ *   The payload is kept alive via `payload_ref`.
+ *
+ * Use `data()` and `size()` for mode-independent access.
  */
 class BytesData : public SerializableObject {
 public:
-    std::vector<uint8_t> bytes;
-    
+    std::vector<uint8_t> bytes;  ///< Owned data (empty in view mode)
+
+    // ── View mode (zero-copy) ────────────────────────────────────────────
+    std::shared_ptr<const std::vector<uint8_t>> payload_ref;  ///< Shared payload (keeps data alive)
+    const uint8_t* view_ptr = nullptr;   ///< Pointer into payload_ref (null = owning mode)
+    size_t view_size = 0;                ///< Size of view slice
+
     BytesData() = default;
     explicit BytesData(std::vector<uint8_t> data) : bytes(std::move(data)) {}
-    
+
+    /// Construct a zero-copy view into a shared payload.
+    BytesData(std::shared_ptr<const std::vector<uint8_t>> payload,
+              const uint8_t* ptr, size_t size)
+        : payload_ref(std::move(payload)), view_ptr(ptr), view_size(size) {}
+
+    /// Mode-independent data pointer.
+    const uint8_t* data() const { return view_ptr ? view_ptr : bytes.data(); }
+
+    /// Mode-independent size.
+    size_t size() const { return view_ptr ? view_size : bytes.size(); }
+
+    /// True if this object borrows data from a shared payload (zero-copy mode).
+    bool is_view() const { return view_ptr != nullptr; }
+
     ObjectType get_type() const override { return ObjectType::Bytes; }
     
     SerializedData serialize() const override;
     
-    // Static factory for deserialization
     static std::unique_ptr<BytesData> deserialize(
         const std::map<std::string, std::string>& metadata,
         const std::vector<uint8_t>& payload
@@ -321,14 +345,30 @@ public:
 };
 
 /**
- * @brief Global deserialize function
- * @param metadata_json JSON metadata string
- * @param payload Binary payload
- * @return Unique pointer to deserialized object
+ * @brief Global deserialize function (owning — copies payload into each object).
  */
 std::unique_ptr<SerializableObject> deserialize(
     const std::string& metadata_json,
     const std::vector<uint8_t>& payload
+);
+
+/**
+ * @brief Zero-copy deserialize — objects borrow data from the shared payload.
+ *
+ * Returns the same types (ListData, NumpyArray, etc.) but BytesData-derived
+ * objects have their view_ptr set to point into the payload.  The shared_ptr
+ * keeps the payload alive as long as any deserialized object references it.
+ *
+ * Usage:
+ *   auto payload_ptr = std::make_shared<std::vector<uint8_t>>(std::move(raw_bytes));
+ *   auto obj = ipc0cp::deserialize(metadata_json, payload_ptr);
+ *   auto* list = dynamic_cast<ListData*>(obj.get());
+ *   auto* arr = dynamic_cast<NumpyArray*>(list->items[0].get());
+ *   // arr->data() points into payload_ptr — zero copy
+ */
+std::unique_ptr<SerializableObject> deserialize(
+    const std::string& metadata_json,
+    std::shared_ptr<const std::vector<uint8_t>> payload
 );
 
 } // namespace ipc0cp
