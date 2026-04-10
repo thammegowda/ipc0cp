@@ -248,6 +248,138 @@ TEST_F(SerializationTest, ListDataMixedPayloads) {
     EXPECT_EQ(text_item->text, "list text");
 }
 
+// ============================================================================
+// Zero-copy deserialize tests
+// ============================================================================
+
+TEST_F(SerializationTest, BytesDataViewMode) {
+    // Create owned BytesData
+    auto owned = std::make_shared<const std::vector<uint8_t>>(
+        std::vector<uint8_t>{10, 20, 30, 40, 50});
+
+    BytesData view(owned, owned->data() + 1, 3);
+
+    EXPECT_TRUE(view.is_view());
+    EXPECT_EQ(view.size(), 3);
+    EXPECT_EQ(view.data()[0], 20);
+    EXPECT_EQ(view.data()[1], 30);
+    EXPECT_EQ(view.data()[2], 40);
+
+    // Owned mode
+    BytesData owned_obj(std::vector<uint8_t>{1, 2, 3});
+    EXPECT_FALSE(owned_obj.is_view());
+    EXPECT_EQ(owned_obj.size(), 3);
+    EXPECT_EQ(owned_obj.data()[0], 1);
+}
+
+TEST_F(SerializationTest, ZeroCopyNumpyArray) {
+    // Create a NumpyArray, serialize it, then zero-copy deserialize
+    NumpyArray arr;
+    arr.shape = {4, 3};
+    arr.dtype = "|u1";  // uint8
+    arr.bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+
+    auto serialized = arr.serialize();
+
+    // Zero-copy deserialize
+    auto payload_ptr = std::make_shared<const std::vector<uint8_t>>(serialized.payload);
+    auto result = ipc0cp::deserialize(serialized.metadata_json, payload_ptr);
+    ASSERT_NE(result, nullptr);
+
+    auto* np = dynamic_cast<NumpyArray*>(result.get());
+    ASSERT_NE(np, nullptr);
+    EXPECT_TRUE(np->is_view());
+    EXPECT_EQ(np->size(), 12);
+    EXPECT_EQ(np->shape, (std::vector<size_t>{4, 3}));
+    EXPECT_EQ(np->dtype, "|u1");
+
+    // Data should point into payload_ptr (same address)
+    EXPECT_EQ(np->data(), payload_ptr->data());
+    EXPECT_EQ(np->data()[0], 1);
+    EXPECT_EQ(np->data()[11], 12);
+}
+
+TEST_F(SerializationTest, ZeroCopyListRoundTrip) {
+    // Build a list: [NumpyArray, NumpyArray, JsonData] — mimics streaming_inpaint protocol
+    std::vector<std::unique_ptr<SerializableObject>> items;
+
+    auto img = std::make_unique<NumpyArray>();
+    img->shape = {2, 2, 3};
+    img->dtype = "|u1";
+    img->bytes = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
+    items.push_back(std::move(img));
+
+    auto mask = std::make_unique<NumpyArray>();
+    mask->shape = {2, 2};
+    mask->dtype = "|u1";
+    mask->bytes = {0, 255, 255, 0};
+    items.push_back(std::move(mask));
+
+    auto meta = std::make_unique<JsonData>(R"({"filename": "test.png"})");
+    items.push_back(std::move(meta));
+
+    ListData list(std::move(items));
+    auto serialized = list.serialize();
+
+    // Zero-copy deserialize
+    auto payload_ptr = std::make_shared<const std::vector<uint8_t>>(serialized.payload);
+    auto result = ipc0cp::deserialize(serialized.metadata_json, payload_ptr);
+    ASSERT_NE(result, nullptr);
+
+    auto* rlist = dynamic_cast<ListData*>(result.get());
+    ASSERT_NE(rlist, nullptr);
+    ASSERT_EQ(rlist->size(), 3);
+
+    // Check image (NumpyArray, view mode)
+    auto* rimg = dynamic_cast<NumpyArray*>(rlist->items[0].get());
+    ASSERT_NE(rimg, nullptr);
+    EXPECT_TRUE(rimg->is_view());
+    EXPECT_EQ(rimg->shape, (std::vector<size_t>{2, 2, 3}));
+    EXPECT_EQ(rimg->size(), 12);
+    EXPECT_EQ(rimg->data()[0], 10);
+    EXPECT_EQ(rimg->data()[11], 120);
+
+    // Check mask (NumpyArray, view mode)
+    auto* rmask = dynamic_cast<NumpyArray*>(rlist->items[1].get());
+    ASSERT_NE(rmask, nullptr);
+    EXPECT_TRUE(rmask->is_view());
+    EXPECT_EQ(rmask->shape, (std::vector<size_t>{2, 2}));
+    EXPECT_EQ(rmask->data()[0], 0);
+    EXPECT_EQ(rmask->data()[1], 255);
+
+    // Check json
+    auto* rjson = dynamic_cast<JsonData*>(rlist->items[2].get());
+    ASSERT_NE(rjson, nullptr);
+    auto j = rjson->json();
+    EXPECT_EQ(j["filename"], "test.png");
+}
+
+TEST_F(SerializationTest, ZeroCopyPayloadLifetime) {
+    // Verify that the payload stays alive as long as any view references it
+    std::weak_ptr<const std::vector<uint8_t>> weak_ref;
+    NumpyArray* raw_ptr = nullptr;
+
+    {
+        NumpyArray arr;
+        arr.shape = {3};
+        arr.dtype = "|u1";
+        arr.bytes = {42, 43, 44};
+        auto serialized = arr.serialize();
+
+        auto payload_ptr = std::make_shared<const std::vector<uint8_t>>(serialized.payload);
+        weak_ref = payload_ptr;
+
+        auto result = ipc0cp::deserialize(serialized.metadata_json, payload_ptr);
+        raw_ptr = dynamic_cast<NumpyArray*>(result.get());
+        ASSERT_NE(raw_ptr, nullptr);
+
+        // payload_ptr goes out of scope here, but result still holds a ref
+        EXPECT_FALSE(weak_ref.expired());  // still alive via result->payload_ref
+    }
+    // result also went out of scope — payload should be freed
+    EXPECT_TRUE(weak_ref.expired());
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
