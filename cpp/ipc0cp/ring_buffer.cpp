@@ -444,7 +444,7 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
     auto start_time = std::chrono::steady_clock::now();
     
     while (true) {
-        lock_buffer();
+        BufferLockGuard guard(*this);
         
         uint64_t write_pos = get_write_pos();
         uint64_t read_pos = get_read_pos();
@@ -465,7 +465,6 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
             current_pos = normalize_abs(current_pos + 8, total_data_bytes_);
             
             if (metadata_size > MAX_METADATA_SIZE) {
-                unlock_buffer();
                 throw IPCException(IPCError::InvalidMetadata, 
                                   "Invalid metadata size");
             }
@@ -477,7 +476,6 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
             // Read start sentinel
             auto start_sentinel = read_bytes(current_pos, 1);
             if (start_sentinel.empty() || start_sentinel[0] != SENTINEL_BYTE) {
-                unlock_buffer();
                 throw IPCException(IPCError::CorruptPayload, "Invalid start sentinel");
             }
             current_pos = normalize_abs(current_pos + 1, total_data_bytes_);
@@ -489,14 +487,13 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
             // Read end sentinel
             auto end_sentinel = read_bytes(current_pos, 1);
             if (end_sentinel.empty() || end_sentinel[0] != SENTINEL_BYTE) {
-                unlock_buffer();
                 throw IPCException(IPCError::CorruptPayload, "Invalid end sentinel");
             }
             
             // Update read position
             set_read_pos(next_pos);
             notify_all();  // Wake producers waiting for space
-            unlock_buffer();
+            guard.unlock();
             
             std::string metadata_json(metadata_bytes.begin(), metadata_bytes.end());
             return std::make_pair(metadata_json, payload);
@@ -506,13 +503,11 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
         if (active_producers == 0 && write_pos == read_pos) {
             // EOS: no more producers and buffer is empty
             eos_received_ = true;
-            unlock_buffer();
             return std::nullopt;
         }
         
         // Still waiting for data
         if (!blocking_) {
-            unlock_buffer();
             throw IPCException(IPCError::BufferEmpty, "Buffer is empty");
         }
         
@@ -521,7 +516,6 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             if (elapsed_ms >= timeout_ms) {
-                unlock_buffer();
                 throw IPCException(IPCError::Timeout, "pop_raw timed out");
             }
         }
@@ -533,13 +527,12 @@ std::optional<std::pair<std::string, std::vector<uint8_t>>> SharedRingBufferCons
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             remaining_ms = timeout_ms - elapsed_ms;
             if (remaining_ms <= 0) {
-                unlock_buffer();
                 throw IPCException(IPCError::Timeout, "pop_raw timed out");
             }
         }
         
         wait_for_signal(remaining_ms);
-        unlock_buffer();
+        // guard releases mutex at end of scope, loop re-acquires via new guard
     }
 }
 
@@ -767,7 +760,7 @@ bool SharedRingBufferProducer::push_raw(
     
     // Wait for buffer space
     while (true) {
-        lock_buffer();
+        BufferLockGuard guard(*this);
         
         uint64_t write_pos = get_write_pos();
         uint64_t read_pos = get_read_pos();
@@ -811,14 +804,12 @@ bool SharedRingBufferProducer::push_raw(
             // Update write position
             set_write_pos(next_pos);
             notify_all();  // Wake consumers
-            unlock_buffer();
             
             return true;
         }
         
         // No space
         if (timeout_ms == 0) {
-            unlock_buffer();
             throw IPCException(IPCError::BufferFull, "Buffer is full (no wait)");
         }
         
@@ -826,7 +817,6 @@ bool SharedRingBufferProducer::push_raw(
             auto elapsed = std::chrono::steady_clock::now() - start_time;
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
             if (elapsed_ms >= timeout_ms) {
-                unlock_buffer();
                 throw IPCException(IPCError::Timeout, "push_raw timed out");
             }
         }
@@ -840,7 +830,7 @@ bool SharedRingBufferProducer::push_raw(
         }
         
         wait_for_signal(remaining_ms);
-        unlock_buffer();
+        // guard releases mutex at end of scope, loop re-acquires via new guard
     }
 }
 
