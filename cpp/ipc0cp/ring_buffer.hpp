@@ -15,6 +15,9 @@
 
 namespace ipc0cp {
 
+// Forward declarations for RAII lock guard.
+class SharedRingBufferBase;
+
 // Type aliases for backward compatibility
 using RingBufferError = IPCError;
 using RingBufferException = IPCException;
@@ -103,6 +106,8 @@ public:
     
     Stats get_stats() const;
 
+    friend class BufferLockGuard;
+
 protected:
     SharedRingBufferBase(
         std::string shm_name,
@@ -157,6 +162,24 @@ protected:
     std::unique_ptr<PosixCondition> condition_;
     
     bool is_producer_ = false;  // Track if this is a producer or consumer for cleanup
+};
+
+/**
+ * @brief RAII lock guard for SharedRingBufferBase.
+ *
+ * Ensures the buffer mutex is released even when an exception (e.g.
+ * std::bad_alloc inside read_bytes) propagates out of pop_raw / push_raw.
+ */
+class BufferLockGuard {
+public:
+    explicit BufferLockGuard(SharedRingBufferBase& buf) : buf_(buf) { buf_.lock_buffer(); }
+    ~BufferLockGuard() { if (held_) buf_.unlock_buffer(); }
+    void unlock() { buf_.unlock_buffer(); held_ = false; }
+    BufferLockGuard(const BufferLockGuard&) = delete;
+    BufferLockGuard& operator=(const BufferLockGuard&) = delete;
+private:
+    SharedRingBufferBase& buf_;
+    bool held_ = true;
 };
 
 /**
