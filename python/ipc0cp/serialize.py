@@ -39,6 +39,13 @@ MAX_METADATA_SIZE = 1024
 logger = logging.getLogger(__name__)
 
 
+def _decode_payload(payload, encoding: str = 'utf-8') -> str:
+    """Decode bytes-like payloads, copying only for objects without decode()."""
+    if hasattr(payload, 'decode'):
+        return payload.decode(encoding)
+    return payload.tobytes().decode(encoding)
+
+
 class ObjectType(Enum):
     """Object types supported by serialization"""
     NUMPY_ARRAY = "ndarray"
@@ -123,7 +130,7 @@ class TextData(BytesData):
     def deserialize(metadata: Dict[str, str], payload: bytes) -> 'TextData':
         """Deserialize from metadata and payload"""
         encoding = metadata.get('encoding', 'utf-8')
-        text = payload.decode(encoding)
+        text = _decode_payload(payload, encoding)
         return TextData(text, encoding)
 
 
@@ -163,7 +170,7 @@ class JsonData(TextData):
     def deserialize(metadata: Dict[str, str], payload: bytes) -> 'JsonData':
         """Deserialize from metadata and payload"""
         encoding = metadata.get('encoding', 'utf-8')
-        json_str = payload.decode(encoding)
+        json_str = _decode_payload(payload, encoding)
         obj = json.loads(json_str)
         return JsonData(obj)
 

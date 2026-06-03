@@ -478,6 +478,17 @@ class SharedRingBufferProducer(SharedRingBufferBase):
         payload_size = len(payload)
         slot_size = SLOT_HEADER_SIZE + metadata_size + 1 + payload_size + 1
 
+        if payload_size > self.max_slot_size:
+            raise ValueError(
+                f"Payload size {payload_size} bytes exceeds max_slot_size "
+                f"{self.max_slot_size} bytes"
+            )
+        if slot_size >= self.total_data_bytes:
+            raise ValueError(
+                f"Slot size {slot_size} bytes must be smaller than data region "
+                f"{self.total_data_bytes} bytes"
+            )
+
         # Wait until at least one consumer is attached.
         # This prevents producers from racing ahead and exiting before a consumer can attach.
         # also, if no consumer ever going to read content, do we even need to work hard and waste cycles?
@@ -511,7 +522,7 @@ class SharedRingBufferProducer(SharedRingBufferBase):
                 read_pos = self._get_read_pos()
                 available = self._available_space(write_pos, read_pos)
                 
-                if available >= slot_size:
+                if available > slot_size:
                     # Reserve slot by updating write_pos atomically
                     next_pos = write_pos + slot_size
                     next_pos = self._normalize_pos(next_pos)
@@ -560,6 +571,147 @@ class SharedRingBufferProducer(SharedRingBufferBase):
                     wait_timeout = min(wait_timeout, remaining)
                 self.condition.wait(timeout=wait_timeout)
     
+    def push_raw_batch(
+        self,
+        items: list,
+        timeout: Optional[float] = None,
+    ) -> int:
+        """
+        Push multiple pre-serialized items, acquiring the global lock once per
+        write-chunk instead of once per item.
+
+        This amortizes the lock + ``condition.notify_all()`` cost across the
+        whole batch, dramatically reducing contention when many producers share
+        a single buffer.
+
+        The on-wire slot layout is identical to ``push_raw`` (so single-item
+        consumers and ``pop``/``pop_batch`` interoperate freely); the only
+        difference is that an entire chunk of slots is published with one
+        ``write_pos`` update and one wakeup.
+
+        Args:
+            items: sequence of ``(metadata_json: str, payload: bytes)`` tuples.
+            timeout: max time to wait in seconds (None = infinite if blocking).
+
+        Returns:
+            Number of items successfully pushed. Equals ``len(items)`` unless the
+            buffer is non-blocking or the timeout elapses (partial push).
+        """
+        if self.shm is None:
+            raise RuntimeError("Shared memory not initialized")
+        if not items:
+            return 0
+
+        # Pre-encode every item once, outside the lock.
+        encoded = []
+        for metadata_json, payload in items:
+            metadata_bytes = metadata_json.encode('utf-8')
+            metadata_size = len(metadata_bytes)
+            if metadata_size > MAX_METADATA_SIZE:
+                raise ValueError(
+                    f"Metadata size {metadata_size} exceeds maximum {MAX_METADATA_SIZE}"
+                )
+            payload_size = len(payload)
+            slot_size = SLOT_HEADER_SIZE + metadata_size + 1 + payload_size + 1
+            if payload_size > self.max_slot_size:
+                raise ValueError(
+                    f"Payload size {payload_size} bytes exceeds max_slot_size "
+                    f"{self.max_slot_size} bytes"
+                )
+            if slot_size >= self.total_data_bytes:
+                raise ValueError(
+                    f"Slot size {slot_size} bytes must be smaller than data region "
+                    f"{self.total_data_bytes} bytes"
+                )
+            encoded.append(
+                (metadata_bytes, metadata_size, payload, payload_size, slot_size)
+            )
+
+        # Wait until at least one consumer is attached (same policy as push_raw).
+        consumer_wait_timeout = (
+            PRODUCER_WAIT_FOR_CONSUMER_TIMEOUT_S if timeout is None else timeout
+        )
+        start_time = time.time()
+        while True:
+            with self.lock:
+                if self._get_active_consumers() >= 1:
+                    break
+                if not self.blocking:
+                    raise IPCException(IPCError.NO_CONSUMERS, "No active consumers")
+                elapsed = time.time() - start_time
+                remaining = consumer_wait_timeout - elapsed
+                if remaining <= 0:
+                    raise IPCException(
+                        IPCError.NO_CONSUMERS,
+                        f"Timed out after {consumer_wait_timeout:.1f}s waiting for a consumer to attach",
+                    )
+                self.condition.wait(timeout=min(0.01, remaining))
+
+        pushed = 0
+        n = len(encoded)
+        start_time = time.time()
+        while pushed < n:
+            with self.lock:
+                write_pos = self._get_write_pos()
+                read_pos = self._get_read_pos()
+                available = self._available_space(write_pos, read_pos)
+
+                current_pos = write_pos
+                wrote_any = False
+                # Write as many queued slots as fit under this single lock hold.
+                while pushed < n:
+                    (metadata_bytes, metadata_size, payload,
+                     payload_size, slot_size) = encoded[pushed]
+                    # Strict check keeps a >=1 byte gap so write_pos can never
+                    # land exactly on read_pos (which would look empty).
+                    if slot_size >= available:
+                        break
+                    next_pos = self._normalize_pos(current_pos + slot_size)
+                    p = current_pos
+                    p = self._write_uint64(p, next_pos)
+                    p = self._write_uint32(p, metadata_size)
+                    p = self._write_uint64(p, payload_size)
+                    p = self._write_with_wrap(p, metadata_bytes)
+                    p = self._write_with_wrap(p, bytes([SENTINEL_BYTE]))
+                    p = self._write_with_wrap(p, payload)
+                    p = self._write_with_wrap(p, bytes([SENTINEL_BYTE]))
+                    current_pos = next_pos
+                    available -= slot_size
+                    pushed += 1
+                    wrote_any = True
+
+                if wrote_any:
+                    # Publish the whole chunk at once with a single wakeup.
+                    self._set_write_pos(current_pos)
+                    self.condition.notify_all()
+
+                if pushed >= n:
+                    return pushed
+
+                # The next item did not fit in the current free space.
+                active_consumers = self._get_active_consumers()
+                if active_consumers == 0 and timeout is None:
+                    raise IPCException(
+                        IPCError.NO_CONSUMERS,
+                        "Buffer full and no active consumers",
+                    )
+                if not self.blocking:
+                    return pushed
+                if timeout is not None and (time.time() - start_time) >= timeout:
+                    return pushed
+
+            # Wait for space (releases the lock while waiting).
+            with self.lock:
+                wait_timeout = 0.001  # 1ms
+                if timeout is not None:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        return pushed
+                    wait_timeout = min(wait_timeout, remaining)
+                self.condition.wait(timeout=wait_timeout)
+
+        return pushed
+
     def available_space(self) -> int:
         """
         Get available space in buffer.
@@ -925,6 +1077,120 @@ class SharedRingBufferConsumer(SharedRingBufferBase):
             self.condition.notify_all()
         
         return obj
+    
+    def pop_batch(
+        self,
+        max_items: int,
+        timeout: Optional[float] = None,
+        max_bytes: int = 0,
+    ) -> list:
+        """
+        Pop up to ``max_items`` objects, acquiring the global lock once for the
+        whole batch instead of once per item.
+
+        Slots are snapshotted into local memory while holding the lock (like
+        ``pop(copy=True)``) and deserialized after the lock is released, so the
+        lock-hold cost is one acquisition plus the memcpy of the drained slots.
+
+        Args:
+            max_items: maximum number of items to return.
+            timeout: max time to wait for the first item (None = infinite if blocking).
+            max_bytes: optional soft cap on bytes copied under the lock; once
+                exceeded the batch stops early (0 = no cap). Bounds how long the
+                lock is held when individual payloads are large.
+
+        Returns:
+            List of deserialized objects (possibly fewer than ``max_items``).
+            An empty list means end-of-stream (all producers finished and the
+            buffer is drained).  Non-blocking empty reads and timeouts raise the
+            same IPCException types as ``pop``.
+        """
+        if self.shm is None:
+            raise IPCException(IPCError.NOT_INITIALIZED)
+        if max_items <= 0:
+            return []
+
+        start_time = time.time()
+        snapshots = []  # local copies of each drained slot's bytes
+
+        while True:
+            with self.lock:
+                write_pos = self._get_write_pos()
+                current_read_pos = self._get_read_pos()
+
+                if write_pos != current_read_pos:
+                    cur = current_read_pos
+                    end_of_region = HEADER_SIZE + self.total_data_bytes
+                    copied = 0
+                    while len(snapshots) < max_items and cur != write_pos:
+                        next_pos = self._read_uint64(cur)
+                        if next_pos >= cur:
+                            slot_len = next_pos - cur
+                        else:
+                            slot_len = (end_of_region - cur) + (next_pos - HEADER_SIZE)
+                        snapshots.append(self._read_bytes(cur, slot_len))
+                        cur = next_pos
+                        copied += slot_len
+                        if max_bytes and copied >= max_bytes:
+                            break
+                    # Free the drained region for producers in one update.
+                    self._set_read_pos(cur)
+                    self.condition.notify_all()
+                    break
+
+                # No data available - check if all producers finished.
+                active_producers = self._get_active_producers()
+                if active_producers == 0:
+                    self.eos_received = True
+                    return []
+                if not self.blocking:
+                    raise IPCException(IPCError.BUFFER_EMPTY)
+                if timeout is not None and (time.time() - start_time) >= timeout:
+                    raise IPCException(IPCError.TIMEOUT, f"Timeout after {timeout} seconds")
+
+            # Wait for data (releases lock while waiting).
+            with self.lock:
+                wait_timeout = 0.001  # 1ms
+                if timeout is not None:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        raise IPCException(IPCError.TIMEOUT)
+                    wait_timeout = min(wait_timeout, remaining)
+                self.condition.wait(timeout=wait_timeout)
+
+        # ── Parse + deserialize every snapshot outside the lock ──────────
+        results = []
+        for slot_snapshot in snapshots:
+            slot_view = memoryview(slot_snapshot)
+            off = 8  # skip next_pos (already consumed)
+            metadata_size = struct.unpack_from('<I', slot_view, off)[0]
+            off += 4
+            if metadata_size > MAX_METADATA_SIZE:
+                raise ValueError(f"Invalid metadata_size: {metadata_size}")
+            payload_size = struct.unpack_from('<Q', slot_view, off)[0]
+            off += 8
+            metadata_bytes = slot_view[off:off + metadata_size]
+            off += metadata_size
+            try:
+                metadata_str = metadata_bytes.tobytes().decode('utf-8')
+            except Exception as e:
+                raise ValueError(f"Failed to parse metadata JSON: {e}")
+            if slot_view[off] != SENTINEL_BYTE:
+                raise IPCException(IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid start sentinel (expected {SENTINEL_BYTE}, got {slot_view[off]})")
+            off += 1
+            payload = slot_view[off:off + payload_size]
+            off += payload_size
+            if slot_view[off] != SENTINEL_BYTE:
+                raise IPCException(IPCError.CORRUPT_PAYLOAD,
+                    f"Invalid end sentinel (expected {SENTINEL_BYTE}, got {slot_view[off]})")
+            try:
+                results.append(deserialize_object(metadata_str, payload))
+            except Exception as e:
+                self.last_error = f"Failed to deserialize: {e}"
+                raise IPCException(IPCError.DESERIALIZATION_FAILED, self.last_error) from e
+
+        return results
     
     def close(self):
         """
